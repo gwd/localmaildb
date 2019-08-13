@@ -106,11 +106,15 @@ func (mdb *MailDB) Fetch() error {
 	// NOTE: imap-client documentation says it's not safe for concurrent access.
 	// Care must therefore be taken to make sure all fetch requests have completed
 	// before using the client again.
+	//
+	// Also note: case must be taken to ensure that this DOES NOT
+	// BLOCK if there are fetches further down the pipeline; otherwise
+	// things may get backed up and deadlock.
 	fetchreq := make(chan *fetchReq, 10)
 	defer close(fetchreq)
 	go func() {
 		for req := range fetchreq {
-			log.Println("fetcher: Making request")
+			log.Printf("fetcher: Making request [%p]", req)
 			req.done <- c.Fetch(req.seqset, req.items, req.messages)
 		}
 	}()
@@ -123,7 +127,7 @@ func (mdb *MailDB) Fetch() error {
 		STRIDE := uint32(50)
 		from := uint32(1)
 
-		envelopestatus := make(chan chan error)
+		envelopestatus := make(chan chan error, 1)
 
 		go func() {
 			for done := range envelopestatus {
@@ -148,16 +152,17 @@ func (mdb *MailDB) Fetch() error {
 
 			envreq := new(fetchReq)
 
-			log.Printf("Reqesting envelopes (%d, %d)", from, to)
 			envreq.seqset = new(imap.SeqSet)
 			envreq.seqset.AddRange(from, to)
 
 			envreq.items = []imap.FetchItem{imap.FetchEnvelope}
 
-			envreq.messages = make(chan *imap.Message, 10)
-			envreq.done = make(chan error)
+			envreq.messages = make(chan *imap.Message, STRIDE)
+			envreq.done = make(chan error, 1)
 
 			go msgIgnoreClose(envreq.messages, envelopes)
+
+			log.Printf("[%p] Reqesting envelopes (%d, %d)", envreq, from, to)
 
 			fetchreq <- envreq
 			envelopestatus <- envreq.done
@@ -170,73 +175,98 @@ func (mdb *MailDB) Fetch() error {
 
 	}()
 
-	bodyreq := new(fetchReq)
+	bodystatus := make(chan chan error, 1)
 
-	bodyreq.seqset = new(imap.SeqSet)
-	tofetch := []*imap.Message{}
-	for msg := range envelopes {
-		if len(tofetch) >= 10 {
-			continue
+	go func() {
+		requested := 0
+
+		// cmsg: Message to check
+		// emsg: Message from envelope
+		// bmsg: Message from body
+		for cmsg := range envelopes {
+			if requested >= 10 {
+				continue
+			}
+
+			if prs, err := mdb.IsMsgIdPresent(cmsg.Envelope.MessageId); err != nil {
+				// FIXME: Not clear what the best thing would be to do
+				// here.
+				log.Fatalf("Checking message presence in database: %v", err)
+			} else if prs {
+				log.Printf(" Message %v present, not fetching", cmsg.Envelope.MessageId)
+				continue
+			}
+
+			done := make(chan error)
+
+			go func(done chan error, emsg *imap.Message) {
+				// Request a single message
+				bodyreq := new(fetchReq)
+				bodyreq.seqset = new(imap.SeqSet)
+				bodyreq.seqset.AddNum(emsg.SeqNum)
+				bodyreq.messages = make(chan *imap.Message, 1)
+				section := &imap.BodySectionName{}
+				section.Peek = true
+				bodyreq.items = []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope}
+				bodyreq.done = make(chan error, 1)
+
+				log.Printf("[%p] Fetching message %s (%s)", bodyreq,
+					emsg.Envelope.MessageId, emsg.Envelope.Subject)
+
+				fetchreq <- bodyreq
+
+				// Wait for the response
+				bmsg := <-bodyreq.messages
+
+				log.Printf("Processing body %v", bmsg.Envelope.MessageId)
+
+				// Process
+				if bmsg.SeqNum != emsg.SeqNum {
+					log.Printf("Unexpected sequence number: wanted %d, got %d!",
+						emsg.SeqNum, bmsg.SeqNum)
+					done <- fmt.Errorf("Unexpected sequence number")
+					return
+				}
+				if bmsg.Envelope.MessageId != emsg.Envelope.MessageId {
+					log.Printf("Unexpected messageid: wanted %s, got %s!",
+						emsg.Envelope.MessageId, bmsg.Envelope.MessageId)
+					done <- fmt.Errorf("Unexpected message id")
+					return
+				}
+				var body imap.Literal
+				for _, body = range bmsg.Body {
+				}
+				if body == nil {
+					done <- fmt.Errorf("No literals in message body")
+					return
+				}
+				if err := mdb.AddMessage(bmsg.Envelope, body, int(bmsg.Size)); err != nil {
+					done <- fmt.Errorf("Adding message to database: %v", err)
+					return
+				}
+
+				done <- nil
+			}(done, cmsg)
+
+			bodystatus <- done
+
+			requested++
 		}
-		log.Printf("Processing msgid %s: %s", msg.Envelope.MessageId, msg.Envelope.Subject)
-		if prs, err := mdb.IsMsgIdPresent(msg.Envelope.MessageId); err != nil {
-			// FIXME: Not clear what the best thing would be to do
-			// here.
-			log.Fatalf("Checking message presence in database: %v", err)
-		} else if !prs {
-			log.Printf(" Messageid not present, adding to fetch list")
-			tofetch = append(tofetch, msg)
-			bodyreq.seqset.AddNum(msg.SeqNum)
-		} else {
-			log.Printf(" Messageid present, not fetching")
+
+		close(bodystatus)
+
+	}()
+
+	log.Printf("Waiting for body processing statuses")
+	for done := range bodystatus {
+		log.Printf("Waiting for body status %v to complete", done)
+		err := <-done
+		if err != nil {
+			log.Printf("Error processing body: %v", err)
 		}
 	}
 
-	log.Printf("Messages to retreive: %v", tofetch)
-
-	if len(tofetch) == 0 {
-		log.Printf("No not-present messages")
-		return nil
-	}
-
-	log.Printf("Fetching %d messages", len(tofetch))
-	bodyreq.messages = make(chan *imap.Message, 10)
-	section := &imap.BodySectionName{}
-	section.Peek = true
-	bodyreq.items = []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope}
-	bodyreq.done = make(chan error, 1)
-
-	fetchreq <- bodyreq
-
-	i := 0
-	for msg := range bodyreq.messages {
-		log.Printf("Processing seqnum %d", msg.SeqNum)
-		if msg.SeqNum != tofetch[i].SeqNum {
-			log.Printf("Unexpected sequence number: wanted %d, got %d!",
-				tofetch[i].SeqNum, msg.SeqNum)
-			return fmt.Errorf("Unexpected sequence number")
-		}
-		if msg.Envelope.MessageId != tofetch[i].Envelope.MessageId {
-			log.Printf("Unexpected messageid: wanted %s, got %s!",
-				tofetch[i].Envelope.MessageId, msg.Envelope.MessageId)
-			return fmt.Errorf("Unexpected message id")
-		}
-		var body imap.Literal
-		for _, body = range msg.Body {
-		}
-		if body == nil {
-			log.Fatalf("No literals in message body")
-		}
-		if err := mdb.AddMessage(msg.Envelope, body, int(msg.Size)); err != nil {
-			// FIXME: Do something more graceful (not clear what the best thing woudl be to do)
-			log.Fatalf("Adding message to database: %v", err)
-		}
-		i++
-	}
-
-	if err := <-bodyreq.done; err != nil {
-		return err
-	}
+	log.Printf("Done!")
 
 	return nil
 }
