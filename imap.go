@@ -6,7 +6,6 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"log"
-	"sync"
 )
 
 type ImapInfo struct {
@@ -15,10 +14,9 @@ type ImapInfo struct {
 }
 
 type MailDB struct {
-	db        *sql.DB
-	imapinfo  *ImapInfo
-	client    *client.Client
-	clientMut sync.Mutex
+	db       *sql.DB
+	imapinfo *ImapInfo
+	client   *client.Client
 }
 
 func (mdb *MailDB) Close() {
@@ -32,24 +30,12 @@ func (mdb *MailDB) Close() {
 	}
 }
 
-func (mdb *MailDB) getClient() *client.Client {
-	mdb.clientMut.Lock()
-	return mdb.client
-}
-
-func (mdb *MailDB) putClient() {
-	mdb.clientMut.Unlock()
-}
-
 func (mdb *MailDB) ImapConnect() error {
 	imapinfo := mdb.imapinfo
 
 	if imapinfo == nil {
 		return fmt.Errorf("IMAP dial info not set up")
 	}
-
-	mdb.clientMut.Lock()
-	defer mdb.clientMut.Unlock()
 
 	if mdb.client != nil {
 		// We already seem to have a connection -- see if it's still alive
@@ -99,6 +85,12 @@ type fetchReq struct {
 	done     chan error
 }
 
+func msgIgnoreClose(in chan *imap.Message, out chan *imap.Message) {
+	for msg := range in {
+		out <- msg
+	}
+}
+
 func (mdb *MailDB) Fetch() error {
 	// Connect or check the connection
 	err := mdb.ImapConnect()
@@ -106,45 +98,82 @@ func (mdb *MailDB) Fetch() error {
 		return err
 	}
 
+	c := mdb.client
+
+	// Get current status
+	status := c.Mailbox()
+
+	// NOTE: imap-client documentation says it's not safe for concurrent access.
+	// Care must therefore be taken to make sure all fetch requests have completed
+	// before using the client again.
 	fetchreq := make(chan *fetchReq, 10)
 	defer close(fetchreq)
 	go func() {
 		for req := range fetchreq {
-			log.Println("fetcher: Acquiring lock")
-			c := mdb.getClient()
 			log.Println("fetcher: Making request")
 			req.done <- c.Fetch(req.seqset, req.items, req.messages)
-			log.Println("fetcher: Releasing lock")
-			mdb.putClient()
 		}
 	}()
 
-	// Get current status
-	c := mdb.getClient()
-	status := c.Mailbox()
-	mdb.putClient()
-
 	// Get a list of all messages in INBOX
-	envreq := new(fetchReq)
+	envelopes := make(chan *imap.Message, 10)
 
-	to := status.Messages
-	from := uint32(1)
-	log.Printf("Fetching %d envelopes", to-from)
-	envreq.seqset = new(imap.SeqSet)
-	envreq.seqset.AddRange(from, to)
+	go func() {
+		STRIDE := uint32(50)
+		from := uint32(1)
 
-	envreq.items = []imap.FetchItem{imap.FetchEnvelope}
+		// FIXME this seems kind of clunky
+		envelopestatus := make(chan error, (status.Messages/STRIDE)+2)
 
-	envreq.messages = make(chan *imap.Message, 10)
-	envreq.done = make(chan error, 1)
+		count := 0
 
-	fetchreq <- envreq
+		for {
+			if from > status.Messages {
+				break
+			}
+			to := from + STRIDE
+			if to > status.Messages {
+				to = status.Messages
+			}
+
+			envreq := new(fetchReq)
+
+			log.Printf("Reqesting envelopes (%d, %d)", from, to)
+			envreq.seqset = new(imap.SeqSet)
+			envreq.seqset.AddRange(from, to)
+
+			envreq.items = []imap.FetchItem{imap.FetchEnvelope}
+
+			envreq.messages = make(chan *imap.Message, 10)
+			envreq.done = envelopestatus
+
+			go msgIgnoreClose(envreq.messages, envelopes)
+
+			fetchreq <- envreq
+			count += 1
+
+			from = to + 1
+		}
+
+		//readenvelopes <- count
+		for count > 0 {
+			log.Printf("Waiting for %d envelope requests", count)
+			err := <-envelopestatus
+			if err != nil {
+				log.Printf("Error fetching envelopes: %v", err)
+			}
+			count--
+		}
+
+		log.Printf("Closing envelopes")
+		close(envelopes)
+	}()
 
 	bodyreq := new(fetchReq)
 
 	bodyreq.seqset = new(imap.SeqSet)
 	tofetch := []*imap.Message{}
-	for msg := range envreq.messages {
+	for msg := range envelopes {
 		if len(tofetch) >= 10 {
 			continue
 		}
@@ -160,11 +189,6 @@ func (mdb *MailDB) Fetch() error {
 		} else {
 			log.Printf(" Messageid present, not fetching")
 		}
-	}
-
-	if err := <-envreq.done; err != nil {
-		log.Printf("Error fetching envelopes: %v", err)
-		return err
 	}
 
 	log.Printf("Messages to retreive: %v", tofetch)
