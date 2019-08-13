@@ -6,6 +6,7 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"log"
+	"sync"
 )
 
 type ImapInfo struct {
@@ -14,9 +15,10 @@ type ImapInfo struct {
 }
 
 type MailDB struct {
-	db       *sql.DB
-	client   *client.Client
-	imapinfo *ImapInfo
+	db        *sql.DB
+	imapinfo  *ImapInfo
+	client    *client.Client
+	clientMut sync.Mutex
 }
 
 func (mdb *MailDB) Close() {
@@ -30,12 +32,24 @@ func (mdb *MailDB) Close() {
 	}
 }
 
+func (mdb *MailDB) getClient() *client.Client {
+	mdb.clientMut.Lock()
+	return mdb.client
+}
+
+func (mdb *MailDB) putClient() {
+	mdb.clientMut.Unlock()
+}
+
 func (mdb *MailDB) ImapConnect() error {
 	imapinfo := mdb.imapinfo
 
 	if imapinfo == nil {
 		return fmt.Errorf("IMAP dial info not set up")
 	}
+
+	mdb.clientMut.Lock()
+	defer mdb.clientMut.Unlock()
 
 	if mdb.client != nil {
 		// We already seem to have a connection -- see if it's still alive
@@ -78,38 +92,59 @@ func (mdb *MailDB) ImapConnect() error {
 	return nil
 }
 
+type fetchReq struct {
+	seqset   *imap.SeqSet
+	items    []imap.FetchItem
+	messages chan *imap.Message
+	done     chan error
+}
+
 func (mdb *MailDB) Fetch() error {
-	// Connect if we're not currently connected
-	if mdb.client == nil {
-		err := mdb.ImapConnect()
-		if err != nil {
-			return err
-		}
+	// Connect or check the connection
+	err := mdb.ImapConnect()
+	if err != nil {
+		return err
 	}
 
-	c := mdb.client
+	fetchreq := make(chan *fetchReq, 10)
+	defer close(fetchreq)
+	go func() {
+		for req := range fetchreq {
+			log.Println("fetcher: Acquiring lock")
+			c := mdb.getClient()
+			log.Println("fetcher: Making request")
+			req.done <- c.Fetch(req.seqset, req.items, req.messages)
+			log.Println("fetcher: Releasing lock")
+			mdb.putClient()
+		}
+	}()
 
 	// Get current status
+	c := mdb.getClient()
 	status := c.Mailbox()
+	mdb.putClient()
 
 	// Get a list of all messages in INBOX
+	envreq := new(fetchReq)
+
 	to := status.Messages
 	from := uint32(1)
 	log.Printf("Fetching %d envelopes", to-from)
-	seqset := new(imap.SeqSet)
-	seqset.AddRange(from, to)
+	envreq.seqset = new(imap.SeqSet)
+	envreq.seqset.AddRange(from, to)
 
-	items := []imap.FetchItem{imap.FetchEnvelope}
+	envreq.items = []imap.FetchItem{imap.FetchEnvelope}
 
-	messages := make(chan *imap.Message, 10)
-	done := make(chan error, 1)
-	go func(ss *imap.SeqSet) {
-		done <- c.Fetch(ss, items, messages)
-	}(seqset)
+	envreq.messages = make(chan *imap.Message, 10)
+	envreq.done = make(chan error, 1)
 
-	seqset = new(imap.SeqSet)
+	fetchreq <- envreq
+
+	bodyreq := new(fetchReq)
+
+	bodyreq.seqset = new(imap.SeqSet)
 	tofetch := []*imap.Message{}
-	for msg := range messages {
+	for msg := range envreq.messages {
 		if len(tofetch) >= 10 {
 			continue
 		}
@@ -121,13 +156,13 @@ func (mdb *MailDB) Fetch() error {
 		} else if !prs {
 			log.Printf(" Messageid not present, adding to fetch list")
 			tofetch = append(tofetch, msg)
-			seqset.AddNum(msg.SeqNum)
+			bodyreq.seqset.AddNum(msg.SeqNum)
 		} else {
 			log.Printf(" Messageid present, not fetching")
 		}
 	}
 
-	if err := <-done; err != nil {
+	if err := <-envreq.done; err != nil {
 		log.Printf("Error fetching envelopes: %v", err)
 		return err
 	}
@@ -140,17 +175,17 @@ func (mdb *MailDB) Fetch() error {
 	}
 
 	log.Printf("Fetching %d messages", len(tofetch))
-	messages = make(chan *imap.Message, 10)
+	bodyreq.messages = make(chan *imap.Message, 10)
 	section := &imap.BodySectionName{}
 	section.Peek = true
-	items = []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope}
+	bodyreq.items = []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope}
+	bodyreq.done = make(chan error, 1)
 
-	go func(ss *imap.SeqSet) {
-		done <- c.Fetch(ss, items, messages)
-	}(seqset)
+	fetchreq <- bodyreq
 
 	i := 0
-	for msg := range messages {
+	for msg := range bodyreq.messages {
+		log.Printf("Processing seqnum %d", msg.SeqNum)
 		if msg.SeqNum != tofetch[i].SeqNum {
 			log.Printf("Unexpected sequence number: wanted %d, got %d!",
 				tofetch[i].SeqNum, msg.SeqNum)
@@ -174,7 +209,7 @@ func (mdb *MailDB) Fetch() error {
 		i++
 	}
 
-	if err := <-done; err != nil {
+	if err := <-bodyreq.done; err != nil {
 		return err
 	}
 
