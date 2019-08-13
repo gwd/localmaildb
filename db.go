@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"fmt"
 	"github.com/emersion/go-imap"
-	"github.com/emersion/go-imap/client"
 	_ "github.com/mattn/go-sqlite3"
 	"io/ioutil"
 	"log"
@@ -17,12 +16,6 @@ import (
 // Update new mail
 
 // Set up hooks / notifications for events
-
-type MailDB struct {
-	db       *sql.DB
-	client   *client.Client
-	imapinfo *ImapInfo
-}
 
 type HeaderPart int
 
@@ -117,17 +110,6 @@ out_rollback:
 out_close:
 	db.Close()
 	return nil, err
-}
-
-func (mdb *MailDB) Close() {
-	if mdb.db != nil {
-		mdb.db.Close()
-		mdb.db = nil
-	}
-	if mdb.client != nil {
-		mdb.client.Logout()
-		mdb.client = nil
-	}
 }
 
 // NB: It would be nice to be able to run a query like:

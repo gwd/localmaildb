@@ -1,6 +1,7 @@
 package localmaildb
 
 import (
+	"database/sql"
 	"fmt"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
@@ -10,6 +11,23 @@ import (
 type ImapInfo struct {
 	Hostname, Username, Password string
 	Port                         int
+}
+
+type MailDB struct {
+	db       *sql.DB
+	client   *client.Client
+	imapinfo *ImapInfo
+}
+
+func (mdb *MailDB) Close() {
+	if mdb.db != nil {
+		mdb.db.Close()
+		mdb.db = nil
+	}
+	if mdb.client != nil {
+		mdb.client.Logout()
+		mdb.client = nil
+	}
 }
 
 func (mdb *MailDB) ImapConnect() error {
