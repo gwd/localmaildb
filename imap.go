@@ -118,14 +118,24 @@ func (mdb *MailDB) Fetch() error {
 	// Get a list of all messages in INBOX
 	envelopes := make(chan *imap.Message, 10)
 
+	// Fetch envelopes in batches of 50, closing once they're all gone.
 	go func() {
 		STRIDE := uint32(50)
 		from := uint32(1)
 
-		// FIXME this seems kind of clunky
-		envelopestatus := make(chan error, (status.Messages/STRIDE)+2)
+		envelopestatus := make(chan chan error)
 
-		count := 0
+		go func() {
+			for done := range envelopestatus {
+				log.Printf("Waiting for channel %v to complete", done)
+				err := <-done
+				if err != nil {
+					log.Printf("Envelope fetch error: %v", err)
+				}
+			}
+			log.Printf("Closing envelopes")
+			close(envelopes)
+		}()
 
 		for {
 			if from > status.Messages {
@@ -145,28 +155,19 @@ func (mdb *MailDB) Fetch() error {
 			envreq.items = []imap.FetchItem{imap.FetchEnvelope}
 
 			envreq.messages = make(chan *imap.Message, 10)
-			envreq.done = envelopestatus
+			envreq.done = make(chan error)
 
 			go msgIgnoreClose(envreq.messages, envelopes)
 
 			fetchreq <- envreq
-			count += 1
+			envelopestatus <- envreq.done
 
 			from = to + 1
 		}
 
-		//readenvelopes <- count
-		for count > 0 {
-			log.Printf("Waiting for %d envelope requests", count)
-			err := <-envelopestatus
-			if err != nil {
-				log.Printf("Error fetching envelopes: %v", err)
-			}
-			count--
-		}
+		log.Printf("Closing envelopestatus")
+		close(envelopestatus)
 
-		log.Printf("Closing envelopes")
-		close(envelopes)
 	}()
 
 	bodyreq := new(fetchReq)
