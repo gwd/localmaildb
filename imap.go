@@ -17,6 +17,10 @@ type MailDB struct {
 	db       *sql.DB
 	imapinfo *ImapInfo
 	client   *client.Client
+
+	// Processing context
+	fetchreq       chan *fetchReq
+	bodyStatusChan chan chan error
 }
 
 func (mdb *MailDB) Close() {
@@ -85,11 +89,163 @@ type fetchReq struct {
 	done     chan error
 }
 
-func msgIgnoreClose(in chan *imap.Message, out chan *imap.Message, done chan bool) {
-	for msg := range in {
-		out <- msg
+// Start a go routine for handling fetch requests.  Close the returned channel when done.
+func (mdb *MailDB) goFetch() chan *fetchReq {
+	mdb.fetchreq = make(chan *fetchReq, 10)
+	go func() {
+		c := mdb.client
+		fetchreq := mdb.fetchreq
+		for req := range fetchreq {
+			log.Printf("fetcher: Making request [%p]", req)
+			req.done <- c.Fetch(req.seqset, req.items, req.messages)
+		}
+	}()
+	return mdb.fetchreq
+}
+
+func (mdb *MailDB) goFetchClose() {
+	close(mdb.fetchreq)
+	mdb.fetchreq = nil
+}
+
+func (mdb *MailDB) goFetchEnvelopeBatches(Messages uint32) chan chan error {
+	mdb.bodyStatusChan = make(chan chan error, 1)
+
+	go func() {
+		envelopeBatchChan := make(chan chan bool, 1)
+
+		// The caller wants to wait until all body fetch operations have
+		// finished; but we don't know how many there are.  We can't close
+		// bodyStatusChan until we know that no more bodyStatus channels
+		// will be sent down it.  So we wait until all envelope batches
+		// have been handled.
+		go func() {
+			for envelopeBatch := range envelopeBatchChan {
+				<-envelopeBatch
+			}
+			close(mdb.bodyStatusChan)
+			mdb.bodyStatusChan = nil
+		}()
+
+		STRIDE := uint32(50)
+		from := uint32(1)
+
+		for {
+			if from > Messages {
+				break
+			}
+			to := from + STRIDE
+			if to > Messages {
+				to = Messages
+			}
+
+			envreq := new(fetchReq)
+
+			envreq.seqset = new(imap.SeqSet)
+			envreq.seqset.AddRange(from, to)
+
+			envreq.items = []imap.FetchItem{imap.FetchEnvelope}
+
+			envreq.messages = make(chan *imap.Message, STRIDE)
+			envreq.done = make(chan error, 1)
+
+			log.Printf("[%p] Reqesting envelopes (%d, %d)", envreq, from, to)
+
+			mdb.fetchreq <- envreq
+
+			envelopeBatch := make(chan bool, 1)
+
+			go mdb.goProcessEnvelopeBatch(envreq, envelopeBatch)
+
+			envelopeBatchChan <- envelopeBatch
+
+			from = to + 1
+		}
+
+		// No more envelope batches will be created.
+		close(envelopeBatchChan)
+	}()
+
+	return mdb.bodyStatusChan
+}
+
+// Go routine to process the outcome of the message
+func (mdb *MailDB) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch chan bool) {
+	// cmsg: Message to check
+	// emsg: Message from envelope
+	// bmsg: Message from body
+	for cmsg := range envreq.messages {
+		if prs, err := mdb.IsMsgIdPresent(cmsg.Envelope.MessageId); err != nil {
+			// FIXME: Not clear what the best thing would be to do
+			// here.
+			log.Fatalf("Checking message presence in database: %v", err)
+		} else if prs {
+			//log.Printf(" Message %v present, not fetching", cmsg.Envelope.MessageId)
+			continue
+		}
+
+		bodyStatus := make(chan error, 1)
+
+		go mdb.goProcessBody(cmsg, bodyStatus)
+
+		mdb.bodyStatusChan <- bodyStatus
 	}
-	done <- true
+
+	err := envreq.done
+	if err != nil {
+		log.Printf("Envelope fetch error: %v", err)
+	}
+
+	envelopeBatch <- true
+}
+
+func (mdb *MailDB) goProcessBody(emsg *imap.Message, bodyStatus chan error) {
+	// Request a single message
+	bodyreq := new(fetchReq)
+	bodyreq.seqset = new(imap.SeqSet)
+	bodyreq.seqset.AddNum(emsg.SeqNum)
+	bodyreq.messages = make(chan *imap.Message, 1)
+	section := &imap.BodySectionName{}
+	section.Peek = true
+	bodyreq.items = []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope}
+	bodyreq.done = make(chan error, 1)
+
+	log.Printf("[%p] Fetching message %s (%s)", bodyreq,
+		emsg.Envelope.MessageId, emsg.Envelope.Subject)
+
+	mdb.fetchreq <- bodyreq
+
+	// Wait for the response
+	bmsg := <-bodyreq.messages
+
+	log.Printf("Processing body %v", bmsg.Envelope.MessageId)
+
+	// Process
+	if bmsg.SeqNum != emsg.SeqNum {
+		log.Printf("Unexpected sequence number: wanted %d, got %d!",
+			emsg.SeqNum, bmsg.SeqNum)
+		bodyStatus <- fmt.Errorf("Unexpected sequence number")
+		return
+	}
+	if bmsg.Envelope.MessageId != emsg.Envelope.MessageId {
+		log.Printf("Unexpected messageid: wanted %s, got %s!",
+			emsg.Envelope.MessageId, bmsg.Envelope.MessageId)
+		bodyStatus <- fmt.Errorf("Unexpected message id")
+		return
+	}
+	var body imap.Literal
+	for _, body = range bmsg.Body {
+	}
+	if body == nil {
+		bodyStatus <- fmt.Errorf("No literals in message body")
+		return
+	}
+	if err := mdb.AddMessage(bmsg.Envelope, body); err != nil {
+		bodyStatus <- fmt.Errorf("Adding message to database: %v", err)
+		return
+	}
+
+	bodyStatus <- nil
 }
 
 func (mdb *MailDB) Fetch() error {
@@ -111,170 +267,16 @@ func (mdb *MailDB) Fetch() error {
 	// Also note: case must be taken to ensure that this DOES NOT
 	// BLOCK if there are fetches further down the pipeline; otherwise
 	// things may get backed up and deadlock.
-	fetchreq := make(chan *fetchReq, 10)
-	defer close(fetchreq)
-	go func() {
-		for req := range fetchreq {
-			log.Printf("fetcher: Making request [%p]", req)
-			req.done <- c.Fetch(req.seqset, req.items, req.messages)
-		}
-	}()
-
-	// Get a list of all messages in INBOX
-	envelopes := make(chan *imap.Message, 10)
+	mdb.goFetch()
+	defer mdb.goFetchClose()
 
 	// Fetch envelopes in batches of 50, closing once they're all gone.
-	go func() {
-		STRIDE := uint32(50)
-		from := uint32(1)
-
-		envelopestatus := make(chan chan error, 1)
-		ignoreclosestatus := make(chan chan bool, 1)
-
-		// Consume envelope status requests
-		go func() {
-			for done := range envelopestatus {
-				log.Printf("Waiting for channel %v to complete", done)
-				err := <-done
-				if err != nil {
-					log.Printf("Envelope fetch error: %v", err)
-				}
-			}
-		}()
-
-		// Consume ignore close requests
-		go func() {
-			for done := range ignoreclosestatus {
-				<-done
-			}
-			log.Printf("Closing envelopes")
-			close(envelopes)
-		}()
-
-		for {
-			if from > status.Messages {
-				break
-			}
-			to := from + STRIDE
-			if to > status.Messages {
-				to = status.Messages
-			}
-
-			envreq := new(fetchReq)
-
-			envreq.seqset = new(imap.SeqSet)
-			envreq.seqset.AddRange(from, to)
-
-			envreq.items = []imap.FetchItem{imap.FetchEnvelope}
-
-			envreq.messages = make(chan *imap.Message, STRIDE)
-			envreq.done = make(chan error, 1)
-
-			ignoredone := make(chan bool, 1)
-
-			go msgIgnoreClose(envreq.messages, envelopes, ignoredone)
-
-			log.Printf("[%p] Reqesting envelopes (%d, %d)", envreq, from, to)
-
-			fetchreq <- envreq
-			envelopestatus <- envreq.done
-			ignoreclosestatus <- ignoredone
-
-			from = to + 1
-		}
-
-		log.Printf("Closing envelopestatus")
-		close(envelopestatus)
-		close(ignoreclosestatus)
-
-	}()
-
-	bodystatus := make(chan chan error, 1)
-
-	go func() {
-		requested := 0
-
-		// cmsg: Message to check
-		// emsg: Message from envelope
-		// bmsg: Message from body
-		for cmsg := range envelopes {
-			if requested >= 100 {
-				continue
-			}
-
-			if prs, err := mdb.IsMsgIdPresent(cmsg.Envelope.MessageId); err != nil {
-				// FIXME: Not clear what the best thing would be to do
-				// here.
-				log.Fatalf("Checking message presence in database: %v", err)
-			} else if prs {
-				//log.Printf(" Message %v present, not fetching", cmsg.Envelope.MessageId)
-				continue
-			}
-
-			done := make(chan error)
-
-			go func(done chan error, emsg *imap.Message) {
-				// Request a single message
-				bodyreq := new(fetchReq)
-				bodyreq.seqset = new(imap.SeqSet)
-				bodyreq.seqset.AddNum(emsg.SeqNum)
-				bodyreq.messages = make(chan *imap.Message, 1)
-				section := &imap.BodySectionName{}
-				section.Peek = true
-				bodyreq.items = []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope}
-				bodyreq.done = make(chan error, 1)
-
-				log.Printf("[%p] Fetching message %s (%s)", bodyreq,
-					emsg.Envelope.MessageId, emsg.Envelope.Subject)
-
-				fetchreq <- bodyreq
-
-				// Wait for the response
-				bmsg := <-bodyreq.messages
-
-				log.Printf("Processing body %v", bmsg.Envelope.MessageId)
-
-				// Process
-				if bmsg.SeqNum != emsg.SeqNum {
-					log.Printf("Unexpected sequence number: wanted %d, got %d!",
-						emsg.SeqNum, bmsg.SeqNum)
-					done <- fmt.Errorf("Unexpected sequence number")
-					return
-				}
-				if bmsg.Envelope.MessageId != emsg.Envelope.MessageId {
-					log.Printf("Unexpected messageid: wanted %s, got %s!",
-						emsg.Envelope.MessageId, bmsg.Envelope.MessageId)
-					done <- fmt.Errorf("Unexpected message id")
-					return
-				}
-				var body imap.Literal
-				for _, body = range bmsg.Body {
-				}
-				if body == nil {
-					done <- fmt.Errorf("No literals in message body")
-					return
-				}
-				if err := mdb.AddMessage(bmsg.Envelope, body); err != nil {
-					done <- fmt.Errorf("Adding message to database: %v", err)
-					return
-				}
-
-				done <- nil
-			}(done, cmsg)
-
-			bodystatus <- done
-
-			requested++
-		}
-
-		close(bodystatus)
-
-	}()
+	bodyStatusChan := mdb.goFetchEnvelopeBatches(status.Messages)
 
 	log.Printf("Waiting for body processing statuses")
-	for done := range bodystatus {
-		log.Printf("Waiting for body status %v to complete", done)
-		err := <-done
+	for bodyStatus := range bodyStatusChan {
+		log.Printf("Waiting for body status %v to complete", bodyStatus)
+		err := <-bodyStatus
 		if err != nil {
 			log.Printf("Error processing body: %v", err)
 		}
