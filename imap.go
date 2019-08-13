@@ -138,6 +138,11 @@ func (mdb *MailDB) Fetch() error {
 				tofetch[i].SeqNum, msg.SeqNum)
 			return fmt.Errorf("Unexpected sequence number")
 		}
+		if msg.Envelope.MessageId != tofetch[i].Envelope.MessageId {
+			log.Printf("Unexpected messageid: wanted %s, got %s!",
+				tofetch[i].Envelope.MessageId, msg.Envelope.MessageId)
+			return fmt.Errorf("Unexpected message id")
+		}
 		var body imap.Literal
 		for _, body = range msg.Body {
 		}
