@@ -85,10 +85,11 @@ type fetchReq struct {
 	done     chan error
 }
 
-func msgIgnoreClose(in chan *imap.Message, out chan *imap.Message) {
+func msgIgnoreClose(in chan *imap.Message, out chan *imap.Message, done chan bool) {
 	for msg := range in {
 		out <- msg
 	}
+	done <- true
 }
 
 func (mdb *MailDB) Fetch() error {
@@ -128,7 +129,9 @@ func (mdb *MailDB) Fetch() error {
 		from := uint32(1)
 
 		envelopestatus := make(chan chan error, 1)
+		ignoreclosestatus := make(chan chan bool, 1)
 
+		// Consume envelope status requests
 		go func() {
 			for done := range envelopestatus {
 				log.Printf("Waiting for channel %v to complete", done)
@@ -136,6 +139,13 @@ func (mdb *MailDB) Fetch() error {
 				if err != nil {
 					log.Printf("Envelope fetch error: %v", err)
 				}
+			}
+		}()
+
+		// Consume ignore close requests
+		go func() {
+			for done := range ignoreclosestatus {
+				<-done
 			}
 			log.Printf("Closing envelopes")
 			close(envelopes)
@@ -160,18 +170,22 @@ func (mdb *MailDB) Fetch() error {
 			envreq.messages = make(chan *imap.Message, STRIDE)
 			envreq.done = make(chan error, 1)
 
-			go msgIgnoreClose(envreq.messages, envelopes)
+			ignoredone := make(chan bool, 1)
+
+			go msgIgnoreClose(envreq.messages, envelopes, ignoredone)
 
 			log.Printf("[%p] Reqesting envelopes (%d, %d)", envreq, from, to)
 
 			fetchreq <- envreq
 			envelopestatus <- envreq.done
+			ignoreclosestatus <- ignoredone
 
 			from = to + 1
 		}
 
 		log.Printf("Closing envelopestatus")
 		close(envelopestatus)
+		close(ignoreclosestatus)
 
 	}()
 
@@ -184,7 +198,7 @@ func (mdb *MailDB) Fetch() error {
 		// emsg: Message from envelope
 		// bmsg: Message from body
 		for cmsg := range envelopes {
-			if requested >= 10 {
+			if requested >= 100 {
 				continue
 			}
 
@@ -193,7 +207,7 @@ func (mdb *MailDB) Fetch() error {
 				// here.
 				log.Fatalf("Checking message presence in database: %v", err)
 			} else if prs {
-				log.Printf(" Message %v present, not fetching", cmsg.Envelope.MessageId)
+				//log.Printf(" Message %v present, not fetching", cmsg.Envelope.MessageId)
 				continue
 			}
 
