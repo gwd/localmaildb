@@ -240,7 +240,7 @@ func (mdb *MailDB) Fetch() error {
 					done <- fmt.Errorf("No literals in message body")
 					return
 				}
-				if err := mdb.AddMessage(bmsg.Envelope, body, int(bmsg.Size)); err != nil {
+				if err := mdb.AddMessage(bmsg.Envelope, body); err != nil {
 					done <- fmt.Errorf("Adding message to database: %v", err)
 					return
 				}

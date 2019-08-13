@@ -200,8 +200,12 @@ func AddAddressTx(tx *sql.Tx, addr *imap.Address) (int, error) {
 	return addrid, nil
 }
 
-func (mdb *MailDB) AddMessage(envelope *imap.Envelope, body imap.Literal, size int) error {
+func (mdb *MailDB) AddMessage(envelope *imap.Envelope, body imap.Literal) error {
 	db := mdb.db
+
+	// This seems to be the amount of outstanding data left to read;
+	// so we must read this first to get an accurate value.
+	size := body.Len()
 
 	// Read body into []bytes
 	message, err := ioutil.ReadAll(body)
