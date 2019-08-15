@@ -1,0 +1,4 @@
+.*.yaml
+*.diff
+*.sqlite
+mailfetch/mailfetch
