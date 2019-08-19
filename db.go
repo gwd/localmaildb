@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"github.com/emersion/go-imap"
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 	"io/ioutil"
 	"log"
 )
@@ -28,15 +28,56 @@ const (
 	HeaderPartBcc     = HeaderPart(6)
 )
 
-func OpenMailDB(filename string, info *ImapInfo) (*MailDB, error) {
-	log.Printf("Opening database %s", filename)
-	db, err := sql.Open("sqlite3", "file:"+filename+"?_fk=true&mode=rwc")
-
-	if err != nil {
-		return nil, fmt.Errorf("Opening database: %v", err)
+func (mdb *MailDB) getMailboxIdTx(tx *sql.Tx) (int, error) {
+	if mdb.mailbox.mailboxId > 0 {
+		return mdb.mailbox.mailboxId, nil
 	}
 
-	mdb := &MailDB{db: db}
+	log.Printf("Looking up mailbox %s", mdb.mailbox.MailboxName)
+	rows, err := tx.Query(`select mailboxid from lmdb_mailboxes where mailboxname = ?`,
+		mdb.mailbox.MailboxName)
+	if err != nil {
+		return 0, nil
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		err = rows.Scan(&mdb.mailbox.mailboxId)
+		if err != nil {
+			return 0, err
+		}
+		log.Printf("Found mailbox %s with id %d",
+			mdb.mailbox.MailboxName, mdb.mailbox.mailboxId)
+	}
+
+	return mdb.mailbox.mailboxId, nil
+}
+
+// Create the mailbox as described if it doesn't exist
+func (mdb *MailDB) initMailboxIdTx(tx *sql.Tx) error {
+	mboxid, err := mdb.getMailboxIdTx(tx)
+	if err != nil {
+		return err
+	}
+
+	if mboxid != 0 {
+		return nil
+	}
+
+	_, err = tx.Exec(`insert into lmdb_mailboxes(mailboxname) values(?)`,
+		mdb.mailbox.MailboxName)
+
+	mboxid, err = mdb.getMailboxIdTx(tx)
+
+	if mboxid == 0 {
+		err = fmt.Errorf("Mailbox %s not present after creation!", mdb.mailbox.MailboxName)
+	}
+
+	return err
+}
+
+func AttachMailDB(db *sql.DB, mailbox *MailboxInfo) (*MailDB, error) {
+	mdb := &MailDB{db: db, mailbox: *mailbox}
 
 	log.Println("Creating tables if they don't exist")
 	// Create tables if they don't exist
@@ -98,10 +139,24 @@ func OpenMailDB(filename string, info *ImapInfo) (*MailDB, error) {
 		goto out_rollback
 	}
 
-	tx.Commit()
+	_, err = tx.Exec(`
+        create table if not exists lmdb_mailboxes(
+            mailboxid integer primary key,
+            mailboxname text)`)
 
-	mdb.db = db
-	mdb.imapinfo = info
+	err = mdb.initMailboxIdTx(tx)
+	if err != nil {
+		goto out_rollback
+	}
+
+	_, err = tx.Exec(`
+        create table if not exists lmdb_mailbox_join(
+            mailboxid integer,
+            messageid text,
+            foreign key(mailboxid) references lmdb_mailboxes,
+            foreign key(messageid) references lmdb_messages)`)
+
+	tx.Commit()
 
 	return mdb, nil
 
@@ -110,6 +165,17 @@ out_rollback:
 out_close:
 	db.Close()
 	return nil, err
+}
+
+func OpenMailDB(filename string, mailbox *MailboxInfo) (*MailDB, error) {
+	log.Printf("Opening database %s", filename)
+	db, err := sql.Open("sqlite3", "file:"+filename+"?_fk=true&mode=rwc")
+
+	if err != nil {
+		return nil, fmt.Errorf("Opening database: %v", err)
+	}
+
+	return AttachMailDB(db, mailbox)
 }
 
 // NB: It would be nice to be able to run a query like:
@@ -264,6 +330,47 @@ func (mdb *MailDB) AddMessage(envelope *imap.Envelope, body imap.Literal) error 
 
 	if err != nil {
 		goto out_rollback
+	}
+
+	tx.Commit()
+	return nil
+
+out_rollback:
+	tx.Rollback()
+	return err
+}
+
+func (mdb *MailDB) updateMailbox(messageIds []string) error {
+	tx, err := mdb.db.Begin()
+	if err != nil {
+		return fmt.Errorf("Starting database transaction")
+	}
+
+	mboxId, err := mdb.getMailboxIdTx(tx)
+	if err != nil || mboxId == 0 {
+		err = fmt.Errorf("Couldn't get mailbox Id!")
+		goto out_rollback
+	}
+
+	// First, delete all rows for this mailbox
+	_, err = tx.Exec(`delete from lmdb_mailbox_join where mailboxid = ?`, mboxId)
+	if err != nil {
+		goto out_rollback
+	}
+
+	// Then insert new message IDs one by one, warning on errors
+	for _, messageId := range messageIds {
+		_, err = tx.Exec(`insert into lmdb_mailbox_join(mailboxid, messageid) values(?, ?)`,
+			mboxId, messageId)
+		if err != nil {
+			sqliteErr, ok := err.(sqlite3.Error)
+			if ok && sqliteErr.Code == sqlite3.ErrConstraint {
+				log.Printf("Inserting record (%d, %s) failed due to constraint, ignoring",
+					mboxId, messageId)
+			} else {
+				goto out_rollback
+			}
+		}
 	}
 
 	tx.Commit()

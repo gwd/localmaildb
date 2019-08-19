@@ -7,7 +7,7 @@ import (
 )
 
 func main() {
-	imapinfo := lmdb.ImapInfo{}
+	mailbox := lmdb.MailboxInfo{}
 
 	viper.SetConfigName(".taskmail")
 	viper.AddConfigPath(".")
@@ -16,27 +16,32 @@ func main() {
 		log.Fatalf("Fatal error config file: %s \n", err)
 	}
 
+	if !viper.IsSet("mailboxname") {
+		log.Fatal("No mailbox name")
+	}
+	mailbox.MailboxName = viper.GetString("mailboxname")
+
 	if viper.IsSet("port") {
-		imapinfo.Port = viper.GetInt("port")
+		mailbox.Port = viper.GetInt("port")
 	}
 
 	if !viper.IsSet("imapserver") {
 		log.Fatal("No imapserver configured")
 	}
-	imapinfo.Hostname = viper.GetString("imapserver")
+	mailbox.Hostname = viper.GetString("imapserver")
 
 	if !viper.IsSet("username") {
 		log.Fatal("No username configured")
 	}
-	imapinfo.Username = viper.GetString("username")
+	mailbox.Username = viper.GetString("username")
 
 	if !viper.IsSet("password") {
 		log.Fatal("No password configured")
 	}
-	imapinfo.Password = viper.GetString("password")
+	mailbox.Password = viper.GetString("password")
 
 	log.Println("Opening database")
-	mdb, err := lmdb.OpenMailDB("maildb.sqlite", &imapinfo)
+	mdb, err := lmdb.OpenMailDB("maildb.sqlite", &mailbox)
 	if err != nil {
 		log.Fatalf("Error opening database: %v", err)
 	}

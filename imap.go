@@ -6,17 +6,29 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"log"
+	"time"
 )
 
-type ImapInfo struct {
+type UpdateStrategy int
+
+const (
+	StrategyAll    = UpdateStrategy(1)
+	StrategyRecent = UpdateStrategy(2)
+)
+
+type MailboxInfo struct {
+	MailboxName string // Required
+	UpdateStrategy
 	Hostname, Username, Password string
 	Port                         int
+	UpdateWindow                 time.Duration
+	mailboxId                    int // ID in database
 }
 
 type MailDB struct {
-	db       *sql.DB
-	imapinfo *ImapInfo
-	client   *client.Client
+	db      *sql.DB
+	mailbox MailboxInfo
+	client  *client.Client
 
 	// Processing context
 	fetchreq       chan *fetchReq
@@ -35,9 +47,9 @@ func (mdb *MailDB) Close() {
 }
 
 func (mdb *MailDB) ImapConnect() error {
-	imapinfo := mdb.imapinfo
+	imapinfo := &mdb.mailbox
 
-	if imapinfo == nil {
+	if imapinfo.Hostname == "" {
 		return fmt.Errorf("IMAP dial info not set up")
 	}
 
@@ -53,7 +65,7 @@ func (mdb *MailDB) ImapConnect() error {
 		// connection
 	}
 
-	Port := mdb.imapinfo.Port
+	Port := imapinfo.Port
 	// Default to 993 if no port is specifieds
 	if Port == 0 {
 		Port = 993
@@ -68,7 +80,7 @@ func (mdb *MailDB) ImapConnect() error {
 	}
 
 	log.Printf("Logging in...")
-	if err = c.Login(mdb.imapinfo.Username, mdb.imapinfo.Password); err != nil {
+	if err = c.Login(imapinfo.Username, imapinfo.Password); err != nil {
 		return fmt.Errorf("Logging in to IMAP server: %v", err)
 	}
 
@@ -108,11 +120,12 @@ func (mdb *MailDB) goFetchClose() {
 	mdb.fetchreq = nil
 }
 
-func (mdb *MailDB) goFetchEnvelopeBatches(Messages uint32) chan chan error {
+func (mdb *MailDB) goFetchEnvelopeBatches(Messages uint32) (chan chan error, chan []string) {
 	mdb.bodyStatusChan = make(chan chan error, 1)
+	messageIds := make(chan []string, 1)
 
 	go func() {
-		envelopeBatchChan := make(chan chan bool, 1)
+		envelopeBatchChan := make(chan chan []string, 1)
 
 		// The caller wants to wait until all body fetch operations have
 		// finished; but we don't know how many there are.  We can't close
@@ -120,11 +133,15 @@ func (mdb *MailDB) goFetchEnvelopeBatches(Messages uint32) chan chan error {
 		// will be sent down it.  So we wait until all envelope batches
 		// have been handled.
 		go func() {
+			allMessages := []string{}
 			for envelopeBatch := range envelopeBatchChan {
-				<-envelopeBatch
+				messages := <-envelopeBatch
+				allMessages = append(allMessages, messages...)
 			}
 			close(mdb.bodyStatusChan)
 			mdb.bodyStatusChan = nil
+			messageIds <- allMessages
+			close(messageIds)
 		}()
 
 		STRIDE := uint32(50)
@@ -153,7 +170,7 @@ func (mdb *MailDB) goFetchEnvelopeBatches(Messages uint32) chan chan error {
 
 			mdb.fetchreq <- envreq
 
-			envelopeBatch := make(chan bool, 1)
+			envelopeBatch := make(chan []string, 1)
 
 			go mdb.goProcessEnvelopeBatch(envreq, envelopeBatch)
 
@@ -166,15 +183,18 @@ func (mdb *MailDB) goFetchEnvelopeBatches(Messages uint32) chan chan error {
 		close(envelopeBatchChan)
 	}()
 
-	return mdb.bodyStatusChan
+	return mdb.bodyStatusChan, messageIds
 }
 
 // Go routine to process the outcome of the message
-func (mdb *MailDB) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch chan bool) {
+func (mdb *MailDB) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch chan []string) {
+	messages := []string{}
+
 	// cmsg: Message to check
 	// emsg: Message from envelope
 	// bmsg: Message from body
 	for cmsg := range envreq.messages {
+		messages = append(messages, cmsg.Envelope.MessageId)
 		if prs, err := mdb.IsMsgIdPresent(cmsg.Envelope.MessageId); err != nil {
 			// FIXME: Not clear what the best thing would be to do
 			// here.
@@ -196,7 +216,7 @@ func (mdb *MailDB) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch chan b
 		log.Printf("Envelope fetch error: %v", err)
 	}
 
-	envelopeBatch <- true
+	envelopeBatch <- messages
 }
 
 func (mdb *MailDB) goProcessBody(emsg *imap.Message, bodyStatus chan error) {
@@ -271,7 +291,7 @@ func (mdb *MailDB) Fetch() error {
 	defer mdb.goFetchClose()
 
 	// Fetch envelopes in batches of 50, closing once they're all gone.
-	bodyStatusChan := mdb.goFetchEnvelopeBatches(status.Messages)
+	bodyStatusChan, messageIdChan := mdb.goFetchEnvelopeBatches(status.Messages)
 
 	log.Printf("Waiting for body processing statuses")
 	for bodyStatus := range bodyStatusChan {
@@ -281,6 +301,12 @@ func (mdb *MailDB) Fetch() error {
 			log.Printf("Error processing body: %v", err)
 		}
 	}
+
+	messageIds := <-messageIdChan
+
+	log.Printf("Inbox contains %d messages", len(messageIds))
+
+	mdb.updateMailbox(messageIds)
 
 	log.Printf("Done!")
 
