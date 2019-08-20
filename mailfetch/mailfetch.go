@@ -4,8 +4,14 @@ import (
 	lmdb "github.com/gwd/localmaildb"
 	"github.com/spf13/viper"
 	"log"
-	"sort"
 )
+
+func TreePrint(message *lmdb.MessageTree, indent string) {
+	log.Printf("%s %v %s", indent, message.Envelope.Date, message.Envelope.Subject)
+	for _, reply := range message.Replies {
+		TreePrint(reply, indent+"*")
+	}
+}
 
 func main() {
 	mailbox := lmdb.MailboxInfo{}
@@ -64,10 +70,23 @@ func main() {
 			log.Fatalf("Getting message roots: %v", err)
 		}
 
-		// Sort by date order
-		sort.Slice(messages, func(i, j int) bool { return messages[i].Envelope.Date.Before(messages[j].Envelope.Date) })
+		var tgtMessage *lmdb.MessageTree
+		tgtMessageId := "<example>"
 		for _, message := range messages {
 			log.Printf("%v | %v", message.Envelope.Date, message.Envelope.Subject)
+
+			if message.Envelope.MessageId == tgtMessageId {
+				tgtMessage = message
+			}
 		}
+
+		log.Printf("Getting message tree for messageid %s", tgtMessageId)
+		err = mdb.GetTree(tgtMessage)
+		if err != nil {
+			log.Fatalf("Getting message tree: %v", err)
+		}
+
+		TreePrint(tgtMessage, "")
+
 	}
 }

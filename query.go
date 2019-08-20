@@ -1,9 +1,11 @@
 package localmaildb
 
 import (
+	"database/sql"
 	"fmt"
 	"github.com/emersion/go-imap"
 	"log"
+	"sort"
 	"time"
 )
 
@@ -14,10 +16,49 @@ type MessageTree struct {
 	Earliest, Latest time.Time
 }
 
+// "Standard" code to scan a message row
+func scanMessage(rows *sql.Rows) (*MessageTree, error) {
+	message := &MessageTree{}
+
+	var dateSeconds int64
+	var messageString string
+
+	err := rows.Scan(&message.Envelope.MessageId,
+		&message.Envelope.Subject,
+		&dateSeconds,
+		&messageString)
+
+	if err != nil {
+		return nil, err
+	}
+
+	message.Envelope.Date = time.Unix(dateSeconds, 0)
+	message.Latest = message.Envelope.Date
+	message.RawMessage = []byte(messageString)
+
+	return message, nil
+}
+
+func scanMessageList(rows *sql.Rows) ([]*MessageTree, error) {
+	messages := []*MessageTree{}
+
+	for rows.Next() {
+		message, err := scanMessage(rows)
+		if err != nil {
+			log.Printf("Scanning results: %v", err)
+			return nil, err
+		}
+		messages = append(messages, message)
+	}
+
+	// Sort by date order ascending
+	sort.Slice(messages, func(i, j int) bool { return messages[i].Envelope.Date.Before(messages[j].Envelope.Date) })
+
+	return messages, nil
+}
+
 // FIXME:
 func (mdb *MailDB) GetMessageRoots() ([]*MessageTree, error) {
-	db := mdb.db
-
 	mboxid := mdb.mailbox.mailboxId
 	// FIXME
 	if mboxid == 0 {
@@ -27,7 +68,7 @@ func (mdb *MailDB) GetMessageRoots() ([]*MessageTree, error) {
 	// Find all messages in the inbox.
 	// Find the "roots" of all these trees
 	// Return them.
-	rows, err := db.Query(`
+	rows, err := mdb.db.Query(`
         WITH RECURSIVE
             ancestor(messageid) AS
                 (select messageid 
@@ -46,26 +87,42 @@ func (mdb *MailDB) GetMessageRoots() ([]*MessageTree, error) {
 		log.Printf("Error getting 'root' message list: %v", err)
 		return nil, err
 	}
+	defer rows.Close()
 
-	messages := []*MessageTree{}
+	messages, err := scanMessageList(rows)
 
-	for rows.Next() {
-		message := &MessageTree{}
-		var dateSeconds int64
-		var messageString string
-		err = rows.Scan(&message.Envelope.MessageId,
-			&message.Envelope.Subject,
-			&dateSeconds,
-			&messageString)
-		if err != nil {
-			log.Printf("Scanning results: %v", err)
-			return nil, err
-		}
-		message.Envelope.Date = time.Unix(dateSeconds, 0)
-		message.Latest = message.Envelope.Date
-		message.RawMessage = []byte(messageString)
-		messages = append(messages, message)
+	if err != nil {
+		return nil, err
 	}
 
 	return messages, nil
+}
+
+func (mdb *MailDB) GetTree(root *MessageTree) error {
+	// Get all messages in-reply-to the root
+	rows, err := mdb.db.Query(`
+        select messageid, subject, date, message
+            from lmdb_messages where inreplyto = $messageid`,
+		root.Envelope.MessageId)
+	if err != nil {
+		log.Printf("Error getting reply message list for messageid %s: %v",
+			root.Envelope.MessageId, err)
+		return err
+	}
+	defer rows.Close()
+
+	root.Replies, err = scanMessageList(rows)
+	if err != nil {
+		return err
+	}
+
+	// And get all the messages for those
+	for _, messages := range root.Replies {
+		err = mdb.GetTree(messages)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
