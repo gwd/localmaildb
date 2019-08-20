@@ -309,11 +309,11 @@ func (mdb *MailDB) AddMessage(envelope *imap.Envelope, body imap.Literal) error 
 	}
 
 	// Insert message: msgid, body, date, inreplyto, size
-	// Conversion of date into unix timestamp should happen automatically
+	// NB that automatic date conversion will give you a string instead of an integer
 	_, err = tx.Exec(`
         insert into lmdb_messages(messageid, subject, date, message, inreplyto, size)
             values (?, ?, ?, ?, ?, ?)`,
-		envelope.MessageId, envelope.Subject, envelope.Date,
+		envelope.MessageId, envelope.Subject, envelope.Date.Unix(),
 		message, envelope.InReplyTo, size)
 	// FIXME: Gracefully handle duplicate message ids
 	if err != nil {
