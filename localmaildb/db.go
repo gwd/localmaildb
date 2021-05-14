@@ -1,12 +1,13 @@
 package localmaildb
 
 import (
-	"database/sql"
 	"fmt"
-	"github.com/emersion/go-imap"
-	"github.com/mattn/go-sqlite3"
 	"io/ioutil"
 	"log"
+
+	"github.com/emersion/go-imap"
+	"github.com/jmoiron/sqlx"
+	"github.com/mattn/go-sqlite3"
 )
 
 // Open maildb
@@ -28,34 +29,26 @@ const (
 	HeaderPartBcc     = HeaderPart(6)
 )
 
-func (mdb *MailDB) getMailboxIdTx(tx *sql.Tx) (int, error) {
+// Fill in mbd.mailbox.mailboxId from mbd.mailbox.MailboxName, if it
+// hasn't been filled in already.  Errors are currently ignored.
+func (mdb *MailDB) getMailboxIdTx(eq sqlx.Ext) (int, error) {
 	if mdb.mailbox.mailboxId > 0 {
 		return mdb.mailbox.mailboxId, nil
 	}
 
 	log.Printf("Looking up mailbox %s", mdb.mailbox.MailboxName)
-	rows, err := tx.Query(`select mailboxid from lmdb_mailboxes where mailboxname = ?`,
+	err := sqlx.Get(eq, &mdb.mailbox.mailboxId, `select mailboxid from lmdb_mailboxes where mailboxname = ?`,
 		mdb.mailbox.MailboxName)
 	if err != nil {
 		return 0, nil
-	}
-	defer rows.Close()
-
-	if rows.Next() {
-		err = rows.Scan(&mdb.mailbox.mailboxId)
-		if err != nil {
-			return 0, err
-		}
-		log.Printf("Found mailbox %s with id %d",
-			mdb.mailbox.MailboxName, mdb.mailbox.mailboxId)
 	}
 
 	return mdb.mailbox.mailboxId, nil
 }
 
 // Create the mailbox as described if it doesn't exist
-func (mdb *MailDB) initMailboxIdTx(tx *sql.Tx) error {
-	mboxid, err := mdb.getMailboxIdTx(tx)
+func (mdb *MailDB) initMailboxIdTx(eq sqlx.Ext) error {
+	mboxid, err := mdb.getMailboxIdTx(eq)
 	if err != nil {
 		return err
 	}
@@ -64,10 +57,13 @@ func (mdb *MailDB) initMailboxIdTx(tx *sql.Tx) error {
 		return nil
 	}
 
-	_, err = tx.Exec(`insert into lmdb_mailboxes(mailboxname) values(?)`,
+	_, err = eq.Exec(`insert into lmdb_mailboxes(mailboxname) values(?)`,
 		mdb.mailbox.MailboxName)
+	if err != nil {
+		return fmt.Errorf("Inserting mailbox id: %w", err)
+	}
 
-	mboxid, err = mdb.getMailboxIdTx(tx)
+	mboxid, err = mdb.getMailboxIdTx(eq)
 
 	if mboxid == 0 {
 		err = fmt.Errorf("Mailbox %s not present after creation!", mdb.mailbox.MailboxName)
@@ -76,12 +72,12 @@ func (mdb *MailDB) initMailboxIdTx(tx *sql.Tx) error {
 	return err
 }
 
-func AttachMailDB(db *sql.DB, mailbox *MailboxInfo) (*MailDB, error) {
+func AttachMailDB(db *sqlx.DB, mailbox *MailboxInfo) (*MailDB, error) {
 	mdb := &MailDB{db: db, mailbox: *mailbox}
 
 	log.Println("Creating tables if they don't exist")
 	// Create tables if they don't exist
-	tx, err := db.Begin()
+	tx, err := db.Beginx()
 	if err != nil {
 		goto out_close
 	}
@@ -169,7 +165,7 @@ out_close:
 
 func OpenMailDB(filename string, mailbox *MailboxInfo) (*MailDB, error) {
 	log.Printf("Opening database %s", filename)
-	db, err := sql.Open("sqlite3", "file:"+filename+"?_fk=true&mode=rwc")
+	db, err := sqlx.Open("sqlite3", "file:"+filename+"?_fk=true&mode=rwc")
 
 	if err != nil {
 		return nil, fmt.Errorf("Opening database: %v", err)
@@ -225,7 +221,7 @@ func (mdb *MailDB) IsMsgIdPresent(msgid string) (bool, error) {
 	return false, nil
 }
 
-func AddAddressTx(tx *sql.Tx, addr *imap.Address) (int, error) {
+func AddAddressTx(eq sqlx.Ext, addr *imap.Address) (int, error) {
 	// We could remove the `on conflict`, and on success
 	// LastInsertId() to get the row Id n the address.  However,
 	// there's a part of me that doesn't trust that the rowid will
@@ -233,23 +229,23 @@ func AddAddressTx(tx *sql.Tx, addr *imap.Address) (int, error) {
 	// code to get the address id on duplicate entries anyway, just
 	// always do the query.
 
-	_, err := tx.Exec(`
+	_, err := eq.Exec(`
         insert into lmdb_addresses(personalname, mailboxname, hostname)
             values (?, ?, ?)
             on conflict do nothing`,
 		addr.PersonalName, addr.MailboxName, addr.HostName)
 	if err != nil {
-		return -1, fmt.Errorf("Inserting address: %v", err)
+		return -1, fmt.Errorf("Inserting address: %w", err)
 	}
 
-	rows, err := tx.Query(
+	rows, err := eq.Query(
 		`select addressid from lmdb_addresses
              where personalname=?
                    and mailboxname=?
                    and hostname=?`,
 		addr.PersonalName, addr.MailboxName, addr.HostName)
 	if err != nil {
-		return -1, fmt.Errorf("Getting id for last insert: %v", err)
+		return -1, fmt.Errorf("Getting id for last insert: %w", err)
 	}
 	defer rows.Close()
 
@@ -279,7 +275,7 @@ func (mdb *MailDB) AddMessage(envelope *imap.Envelope, body imap.Literal) error 
 		return fmt.Errorf("Reading message text from imap.Literal: %v", err)
 	}
 
-	tx, err := db.Begin()
+	tx, err := db.Beginx()
 	if err != nil {
 		return err
 	}
@@ -341,7 +337,7 @@ out_rollback:
 }
 
 func (mdb *MailDB) updateMailbox(messageIds []string) error {
-	tx, err := mdb.db.Begin()
+	tx, err := mdb.db.Beginx()
 	if err != nil {
 		return fmt.Errorf("Starting database transaction")
 	}

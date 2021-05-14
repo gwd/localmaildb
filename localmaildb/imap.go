@@ -1,12 +1,14 @@
 package localmaildb
 
 import (
-	"database/sql"
 	"fmt"
-	"github.com/emersion/go-imap"
-	"github.com/emersion/go-imap/client"
 	"log"
 	"time"
+
+	"github.com/jmoiron/sqlx"
+
+	"github.com/emersion/go-imap"
+	"github.com/emersion/go-imap/client"
 )
 
 type UpdateStrategy int
@@ -26,7 +28,7 @@ type MailboxInfo struct {
 }
 
 type MailDB struct {
-	db      *sql.DB
+	db      *sqlx.DB
 	mailbox MailboxInfo
 	client  *client.Client
 
