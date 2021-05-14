@@ -1,13 +1,17 @@
 package localmaildb
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"net/mail"
+	"regexp"
 
-	"github.com/emersion/go-imap"
 	"github.com/jmoiron/sqlx"
 	"github.com/mattn/go-sqlite3"
+
+	"gitlab.com/martyros/sqlutil/liteutil"
 	"gitlab.com/martyros/sqlutil/txutil"
 )
 
@@ -29,6 +33,14 @@ const (
 	HeaderPartCc      = HeaderPart(5)
 	HeaderPartBcc     = HeaderPart(6)
 )
+
+var headerPartFieldName = [...]string{
+	HeaderPartFrom:    "From",
+	HeaderPartReplyTo: "Reply-to",
+	HeaderPartTo:      "To",
+	HeaderPartCc:      "Cc",
+	HeaderPartBcc:     "Bcc",
+}
 
 type MailDB struct {
 	db *sqlx.DB
@@ -216,7 +228,7 @@ func (mdb *MailDB) IsMsgIdPresent(msgid string) (bool, error) {
 	return false, nil
 }
 
-func AddAddressTx(eq sqlx.Ext, addr *imap.Address) (int, error) {
+func AddAddressTx(eq sqlx.Ext, addr *Address) (int, error) {
 	// We could remove the `on conflict`, and on success
 	// LastInsertId() to get the row Id n the address.  However,
 	// there's a part of me that doesn't trust that the rowid will
@@ -257,36 +269,92 @@ func AddAddressTx(eq sqlx.Ext, addr *imap.Address) (int, error) {
 	return addrid, nil
 }
 
-func (mdb *MailDB) AddMessage(envelope *imap.Envelope, body imap.Literal) error {
+type Address struct {
+	PersonalName string
+	MailboxName  string
+	HostName     string
+}
+
+var reEmail = regexp.MustCompile("(.*)@(.*)")
+
+func convertAddress(in *mail.Address, out *Address) error {
+	out.PersonalName = in.Name
+
+	sub := reEmail.FindStringSubmatch(in.Address)
+	if sub == nil {
+		return fmt.Errorf("Badly formed email address: %v", in.Address)
+	}
+	out.MailboxName = sub[1]
+	out.HostName = sub[2]
+
+	return nil
+}
+
+func mailAddressToOurAddress(in []*mail.Address) ([]Address, error) {
+	out := make([]Address, len(in))
+	for i := range in {
+		err := convertAddress(in[i], &out[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// FIXME: Make a separate type for this and implement Is, so that
+// we can specify which message id was present.
+var ErrMsgidPresent = errors.New("Msgid Present")
+
+func (mdb *MailDB) AddMessage(message []byte) error {
 	db := mdb.db
 
-	// This seems to be the amount of outstanding data left to read;
-	// so we must read this first to get an accurate value.
-	size := body.Len()
-
-	// Read body into []bytes
-	message, err := ioutil.ReadAll(body)
+	m, err := mail.ReadMessage(bytes.NewReader(message))
 	if err != nil {
-		return fmt.Errorf("Reading message text from imap.Literal: %v", err)
+		return fmt.Errorf("Parsing message as a mail: %w", err)
+	}
+
+	envelope := map[HeaderPart][]Address{}
+	for part, fieldName := range headerPartFieldName {
+		if fieldName == "" {
+			continue
+		}
+
+		theiraddr, err := m.Header.AddressList(fieldName)
+		if err != nil {
+			if err == mail.ErrHeaderNotPresent {
+				continue
+			}
+			return fmt.Errorf("Getting address list for field %s: %w",
+				fieldName, err)
+		}
+
+		envelope[HeaderPart(part)], err = mailAddressToOurAddress(theiraddr)
+		if err != nil {
+			return fmt.Errorf("Converting addresses: %w", err)
+		}
+	}
+
+	messageId := m.Header.Get("Message-ID")
+	inReplyTo := m.Header.Get("In-Reply-To")
+	subject := m.Header.Get("Subject")
+	date, err := m.Header.Date()
+	if err != nil {
+		return fmt.Errorf("Parsing message date: %w", err)
 	}
 
 	err = txutil.TxLoopDb(db, func(eq sqlx.Ext) error {
 		// Uses function-wide tx and envelope variables.
 		// Defined here rather than below to allow the goto.
-		addressListHelper := func(addrlist []*imap.Address, headerPart HeaderPart, err error) error {
-			// Pass through errors to handle once at the end
-			if err != nil {
-				return err
-			}
-			for _, addr := range addrlist {
-				addrId, err := AddAddressTx(eq, addr)
+		addressListHelper := func(addrlist []Address, headerPart HeaderPart) error {
+			for i := range addrlist {
+				addrId, err := AddAddressTx(eq, &addrlist[i])
 				if err != nil {
-					return fmt.Errorf("Adding address: %v", err)
+					return fmt.Errorf("Adding address: %w", err)
 				}
 				_, err = eq.Exec(`
             insert into lmdb_envelopejoin(messageid, addressid, envelopepart)
                 values(?, ?, ?)`,
-					envelope.MessageId, addrId,
+					messageId, addrId,
 					headerPart)
 				if err != nil {
 					return fmt.Errorf("Inserting envelope join: %w", err)
@@ -300,21 +368,24 @@ func (mdb *MailDB) AddMessage(envelope *imap.Envelope, body imap.Literal) error 
 		_, err = eq.Exec(`
         insert into lmdb_messages(messageid, subject, date, message, inreplyto, size)
             values (?, ?, ?, ?, ?, ?)`,
-			envelope.MessageId, envelope.Subject, envelope.Date.Unix(),
-			message, envelope.InReplyTo, size)
-		// FIXME: Gracefully handle duplicate message ids
+			messageId, subject, date,
+			message, inReplyTo, len(message))
 		if err != nil {
-			return fmt.Errorf("Inserting message: %w", err)
+			if liteutil.IsErrorConstraintUnique(err) {
+				return ErrMsgidPresent
+			} else {
+				return fmt.Errorf("Inserting message: %w", err)
+			}
 		}
 
-		err = addressListHelper(envelope.From, HeaderPartFrom, nil)
-		err = addressListHelper(envelope.Sender, HeaderPartSender, err)
-		err = addressListHelper(envelope.ReplyTo, HeaderPartReplyTo, err)
-		err = addressListHelper(envelope.To, HeaderPartTo, err)
-		err = addressListHelper(envelope.Cc, HeaderPartCc, err)
-		err = addressListHelper(envelope.Bcc, HeaderPartBcc, err)
+		for part, list := range envelope {
+			err := addressListHelper(list, part)
+			if err != nil {
+				return err
+			}
+		}
 
-		return err
+		return nil
 	})
 
 	return err

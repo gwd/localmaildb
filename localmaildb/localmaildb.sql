@@ -34,7 +34,7 @@ create table if not exists lmdb_addresses(
 create table if not exists lmdb_envelopejoin(
     messageid text not null,
     addressid integer not null,
-    envelopepart integer not null,
+    envelopepart integer not null, /* FIXME: This should probably be 'field' */
     foreign key(messageid) references lmdb_messages,
     foreign key(addressid) references lmdb_addresses)
 
