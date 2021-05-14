@@ -8,6 +8,8 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/jmoiron/sqlx"
 	"github.com/mattn/go-sqlite3"
+
+	"gitlab.com/martyros/sqlutil/txutil"
 )
 
 // Open maildb
@@ -275,64 +277,53 @@ func (mdb *MailDB) AddMessage(envelope *imap.Envelope, body imap.Literal) error 
 		return fmt.Errorf("Reading message text from imap.Literal: %v", err)
 	}
 
-	tx, err := db.Beginx()
-	if err != nil {
-		return err
-	}
-
-	// Uses function-wide tx and envelope variables.
-	// Defined here rather than below to allow the goto.
-	addressListHelper := func(addrlist []*imap.Address, headerPart HeaderPart, err error) error {
-		// Pass through errors to handle once at the end
-		if err != nil {
-			return err
-		}
-		for _, addr := range addrlist {
-			addrId, err := AddAddressTx(tx, addr)
+	err = txutil.TxLoopDb(db, func(eq sqlx.Ext) error {
+		// Uses function-wide tx and envelope variables.
+		// Defined here rather than below to allow the goto.
+		addressListHelper := func(addrlist []*imap.Address, headerPart HeaderPart, err error) error {
+			// Pass through errors to handle once at the end
 			if err != nil {
-				return fmt.Errorf("Adding address: %v", err)
+				return err
 			}
-			_, err = tx.Exec(`
+			for _, addr := range addrlist {
+				addrId, err := AddAddressTx(eq, addr)
+				if err != nil {
+					return fmt.Errorf("Adding address: %v", err)
+				}
+				_, err = eq.Exec(`
             insert into lmdb_envelopejoin(messageid, addressid, envelopepart)
                 values(?, ?, ?)`,
-				envelope.MessageId, addrId,
-				headerPart)
-			if err != nil {
-				return fmt.Errorf("Inserting envelope join: %v", err)
+					envelope.MessageId, addrId,
+					headerPart)
+				if err != nil {
+					return fmt.Errorf("Inserting envelope join: %w", err)
+				}
 			}
+			return nil
 		}
-		return nil
-	}
 
-	// Insert message: msgid, body, date, inreplyto, size
-	// NB that automatic date conversion will give you a string instead of an integer
-	_, err = tx.Exec(`
+		// Insert message: msgid, body, date, inreplyto, size
+		// NB that automatic date conversion will give you a string instead of an integer
+		_, err = eq.Exec(`
         insert into lmdb_messages(messageid, subject, date, message, inreplyto, size)
             values (?, ?, ?, ?, ?, ?)`,
-		envelope.MessageId, envelope.Subject, envelope.Date.Unix(),
-		message, envelope.InReplyTo, size)
-	// FIXME: Gracefully handle duplicate message ids
-	if err != nil {
-		err = fmt.Errorf("Inserting message: %v", err)
-		goto out_rollback
-	}
+			envelope.MessageId, envelope.Subject, envelope.Date.Unix(),
+			message, envelope.InReplyTo, size)
+		// FIXME: Gracefully handle duplicate message ids
+		if err != nil {
+			return fmt.Errorf("Inserting message: %w", err)
+		}
 
-	err = addressListHelper(envelope.From, HeaderPartFrom, nil)
-	err = addressListHelper(envelope.Sender, HeaderPartSender, err)
-	err = addressListHelper(envelope.ReplyTo, HeaderPartReplyTo, err)
-	err = addressListHelper(envelope.To, HeaderPartTo, err)
-	err = addressListHelper(envelope.Cc, HeaderPartCc, err)
-	err = addressListHelper(envelope.Bcc, HeaderPartBcc, err)
+		err = addressListHelper(envelope.From, HeaderPartFrom, nil)
+		err = addressListHelper(envelope.Sender, HeaderPartSender, err)
+		err = addressListHelper(envelope.ReplyTo, HeaderPartReplyTo, err)
+		err = addressListHelper(envelope.To, HeaderPartTo, err)
+		err = addressListHelper(envelope.Cc, HeaderPartCc, err)
+		err = addressListHelper(envelope.Bcc, HeaderPartBcc, err)
 
-	if err != nil {
-		goto out_rollback
-	}
+		return err
+	})
 
-	tx.Commit()
-	return nil
-
-out_rollback:
-	tx.Rollback()
 	return err
 }
 
