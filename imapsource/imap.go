@@ -27,8 +27,7 @@ type MailboxInfo struct {
 	mailboxId                    int // ID in database
 }
 
-type MailDB struct {
-	db      *sqlx.DB
+type ImapSource struct {
 	mailbox MailboxInfo
 	client  *client.Client
 
@@ -37,18 +36,14 @@ type MailDB struct {
 	bodyStatusChan chan chan error
 }
 
-func (mdb *MailDB) Close() {
-	if mdb.db != nil {
-		mdb.db.Close()
-		mdb.db = nil
-	}
-	if mdb.client != nil {
-		mdb.client.Logout()
-		mdb.client = nil
+func (isrc *ImapSource) Close() {
+	if isrc.client != nil {
+		isrc.client.Logout()
+		isrc.client = nil
 	}
 }
 
-func (mdb *MailDB) ImapConnect() error {
+func (mdb *ImapSource) ImapConnect() error {
 	imapinfo := &mdb.mailbox
 
 	if imapinfo.Hostname == "" {
@@ -97,6 +92,7 @@ func (mdb *MailDB) ImapConnect() error {
 }
 
 type fetchReq struct {
+	mdb      MailDb
 	seqset   *imap.SeqSet
 	items    []imap.FetchItem
 	messages chan *imap.Message
@@ -104,7 +100,7 @@ type fetchReq struct {
 }
 
 // Start a go routine for handling fetch requests.  Close the returned channel when done.
-func (mdb *MailDB) goFetch() chan *fetchReq {
+func (mdb *ImapSource) goFetch() chan *fetchReq {
 	mdb.fetchreq = make(chan *fetchReq, 10)
 	go func() {
 		c := mdb.client
@@ -117,12 +113,12 @@ func (mdb *MailDB) goFetch() chan *fetchReq {
 	return mdb.fetchreq
 }
 
-func (mdb *MailDB) goFetchClose() {
+func (mdb *ImapSource) goFetchClose() {
 	close(mdb.fetchreq)
 	mdb.fetchreq = nil
 }
 
-func (mdb *MailDB) goFetchEnvelopeBatches(Messages uint32) (chan chan error, chan []string) {
+func (mdb *ImapSource) goFetchEnvelopeBatches(Messages uint32) (chan chan error, chan []string) {
 	mdb.bodyStatusChan = make(chan chan error, 1)
 	messageIds := make(chan []string, 1)
 
@@ -189,7 +185,7 @@ func (mdb *MailDB) goFetchEnvelopeBatches(Messages uint32) (chan chan error, cha
 }
 
 // Go routine to process the outcome of the message
-func (mdb *MailDB) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch chan []string) {
+func (mdb *ImapSource) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch chan []string) {
 	messages := []string{}
 
 	// cmsg: Message to check
@@ -221,7 +217,7 @@ func (mdb *MailDB) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch chan [
 	envelopeBatch <- messages
 }
 
-func (mdb *MailDB) goProcessBody(emsg *imap.Message, bodyStatus chan error) {
+func (mdb *ImapSource) goProcessBody(envreq *fetchReq, emsg *imap.Message, bodyStatus chan error) {
 	// Request a single message
 	bodyreq := new(fetchReq)
 	bodyreq.seqset = new(imap.SeqSet)
@@ -262,7 +258,7 @@ func (mdb *MailDB) goProcessBody(emsg *imap.Message, bodyStatus chan error) {
 		bodyStatus <- fmt.Errorf("No literals in message body")
 		return
 	}
-	if err := mdb.AddMessage(bmsg.Envelope, body); err != nil {
+	if err := envreq.mdb.AddMessage(bmsg.Envelope, body); err != nil {
 		bodyStatus <- fmt.Errorf("Adding message to database: %v", err)
 		return
 	}
@@ -270,14 +266,15 @@ func (mdb *MailDB) goProcessBody(emsg *imap.Message, bodyStatus chan error) {
 	bodyStatus <- nil
 }
 
-func (mdb *MailDB) Fetch() error {
+// Fetch mail from ImapSource and put it into mdb
+func (src *ImapSource) Fetch(mdb MailDB) error {
 	// Connect or check the connection
-	err := mdb.ImapConnect()
+	err := src.ImapConnect()
 	if err != nil {
 		return err
 	}
 
-	c := mdb.client
+	c := src.client
 
 	// Get current status
 	status := c.Mailbox()
@@ -289,11 +286,11 @@ func (mdb *MailDB) Fetch() error {
 	// Also note: case must be taken to ensure that this DOES NOT
 	// BLOCK if there are fetches further down the pipeline; otherwise
 	// things may get backed up and deadlock.
-	mdb.goFetch()
-	defer mdb.goFetchClose()
+	src.goFetch()
+	defer src.goFetchClose()
 
 	// Fetch envelopes in batches of 50, closing once they're all gone.
-	bodyStatusChan, messageIdChan := mdb.goFetchEnvelopeBatches(status.Messages)
+	bodyStatusChan, messageIdChan := src.goFetchEnvelopeBatches(status.Messages)
 
 	log.Printf("Waiting for body processing statuses")
 	for bodyStatus := range bodyStatusChan {
@@ -308,7 +305,7 @@ func (mdb *MailDB) Fetch() error {
 
 	log.Printf("Inbox contains %d messages", len(messageIds))
 
-	mdb.updateMailbox(messageIds)
+	mdb.UpdateMailbox(messageIds)
 
 	log.Printf("Done!")
 

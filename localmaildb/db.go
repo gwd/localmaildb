@@ -8,7 +8,6 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/jmoiron/sqlx"
 	"github.com/mattn/go-sqlite3"
-
 	"gitlab.com/martyros/sqlutil/txutil"
 )
 
@@ -31,51 +30,38 @@ const (
 	HeaderPartBcc     = HeaderPart(6)
 )
 
+type MailDB struct {
+	db *sqlx.DB
+}
+
 // Fill in mbd.mailbox.mailboxId from mbd.mailbox.MailboxName, if it
-// hasn't been filled in already.  Errors are currently ignored.
-func (mdb *MailDB) getMailboxIdTx(eq sqlx.Ext) (int, error) {
-	if mdb.mailbox.mailboxId > 0 {
-		return mdb.mailbox.mailboxId, nil
-	}
-
-	log.Printf("Looking up mailbox %s", mdb.mailbox.MailboxName)
-	err := sqlx.Get(eq, &mdb.mailbox.mailboxId, `select mailboxid from lmdb_mailboxes where mailboxname = ?`,
-		mdb.mailbox.MailboxName)
+// hasn't been filled in already.
+func mailboxNameToIdTx(eq sqlx.Ext, mailboxname string) (int, error) {
+	var mailboxId int
+	log.Printf("Looking up mailbox %s", mailboxname)
+	err := sqlx.Get(eq, &mailboxId, `select mailboxid from lmdb_mailboxes where mailboxname = ?`,
+		mailboxname)
 	if err != nil {
-		return 0, nil
+		return 0, err
 	}
 
-	return mdb.mailbox.mailboxId, nil
+	return mailboxId, nil
 }
 
 // Create the mailbox as described if it doesn't exist
-func (mdb *MailDB) initMailboxIdTx(eq sqlx.Ext) error {
-	mboxid, err := mdb.getMailboxIdTx(eq)
-	if err != nil {
-		return err
-	}
-
-	if mboxid != 0 {
-		return nil
-	}
-
-	_, err = eq.Exec(`insert into lmdb_mailboxes(mailboxname) values(?)`,
-		mdb.mailbox.MailboxName)
+func (mdb *MailDB) CreateMailbox(mailboxname string) error {
+	_, err := mdb.db.Exec(`insert into lmdb_mailboxes(mailboxname) values(?)`,
+		mailboxname)
 	if err != nil {
 		return fmt.Errorf("Inserting mailbox id: %w", err)
 	}
-
-	mboxid, err = mdb.getMailboxIdTx(eq)
-
-	if mboxid == 0 {
-		err = fmt.Errorf("Mailbox %s not present after creation!", mdb.mailbox.MailboxName)
-	}
-
-	return err
+	return nil
 }
 
-func AttachMailDB(db *sqlx.DB, mailbox *MailboxInfo) (*MailDB, error) {
-	mdb := &MailDB{db: db, mailbox: *mailbox}
+// AttachMailDB takes an existing DB connection and returns a MailDB
+// object.  It will create the lmdb schema tables if they don't exist.
+func AttachMailDB(db *sqlx.DB) (*MailDB, error) {
+	mdb := &MailDB{db: db}
 
 	log.Println("Creating tables if they don't exist")
 	// Create tables if they don't exist
@@ -142,10 +128,10 @@ func AttachMailDB(db *sqlx.DB, mailbox *MailboxInfo) (*MailDB, error) {
             mailboxid integer primary key,
             mailboxname text)`)
 
-	err = mdb.initMailboxIdTx(tx)
-	if err != nil {
-		goto out_rollback
-	}
+	// err = mdb.initMailboxIdTx(tx)
+	// if err != nil {
+	// 	goto out_rollback
+	// }
 
 	_, err = tx.Exec(`
         create table if not exists lmdb_mailbox_join(
@@ -165,7 +151,7 @@ out_close:
 	return nil, err
 }
 
-func OpenMailDB(filename string, mailbox *MailboxInfo) (*MailDB, error) {
+func OpenMailDB(filename string) (*MailDB, error) {
 	log.Printf("Opening database %s", filename)
 	db, err := sqlx.Open("sqlite3", "file:"+filename+"?_fk=true&mode=rwc")
 
@@ -173,7 +159,14 @@ func OpenMailDB(filename string, mailbox *MailboxInfo) (*MailDB, error) {
 		return nil, fmt.Errorf("Opening database: %v", err)
 	}
 
-	return AttachMailDB(db, mailbox)
+	return AttachMailDB(db)
+}
+
+func (mdb *MailDB) Close() {
+	if mdb.db != nil {
+		mdb.db.Close()
+		mdb.db = nil
+	}
 }
 
 // NB: It would be nice to be able to run a query like:
@@ -327,43 +320,40 @@ func (mdb *MailDB) AddMessage(envelope *imap.Envelope, body imap.Literal) error 
 	return err
 }
 
-func (mdb *MailDB) updateMailbox(messageIds []string) error {
-	tx, err := mdb.db.Beginx()
-	if err != nil {
-		return fmt.Errorf("Starting database transaction")
-	}
+// Replace mailbox messageid list with the messageids
+func (mdb *MailDB) UpdateMailbox(mailboxname string, messageIds []string) error {
+	return txutil.TxLoopDb(mdb.db, func(eq sqlx.Ext) error {
+		mboxId, err := mailboxNameToIdTx(eq, mailboxname)
+		if err != nil || mboxId == 0 {
+			return fmt.Errorf("Couldn't get mailbox Id!")
+		}
 
-	mboxId, err := mdb.getMailboxIdTx(tx)
-	if err != nil || mboxId == 0 {
-		err = fmt.Errorf("Couldn't get mailbox Id!")
-		goto out_rollback
-	}
-
-	// First, delete all rows for this mailbox
-	_, err = tx.Exec(`delete from lmdb_mailbox_join where mailboxid = ?`, mboxId)
-	if err != nil {
-		goto out_rollback
-	}
-
-	// Then insert new message IDs one by one, warning on errors
-	for _, messageId := range messageIds {
-		_, err = tx.Exec(`insert into lmdb_mailbox_join(mailboxid, messageid) values(?, ?)`,
-			mboxId, messageId)
+		// First, delete all rows for this mailbox
+		_, err = eq.Exec(`delete from lmdb_mailbox_join where mailboxid = ?`, mboxId)
 		if err != nil {
-			sqliteErr, ok := err.(sqlite3.Error)
-			if ok && sqliteErr.Code == sqlite3.ErrConstraint {
-				log.Printf("Inserting record (%d, %s) failed due to constraint, ignoring",
-					mboxId, messageId)
-			} else {
-				goto out_rollback
+			return fmt.Errorf("Deleting old mailbox entries: %w", err)
+		}
+
+		// Then insert new message IDs one by one, warning on errors
+		for _, messageId := range messageIds {
+			_, err = eq.Exec(`insert into lmdb_mailbox_join(mailboxid, messageid) values(?, ?)`,
+				mboxId, messageId)
+			if err != nil {
+				// FIXME: What's this about?  We just dropped all the
+				// entries above, there shouldn't be any constraint
+				// violations unless there are duplicate message ids
+				// in the list
+				sqliteErr, ok := err.(sqlite3.Error)
+				if ok && sqliteErr.Code == sqlite3.ErrConstraint {
+					log.Printf("Inserting record (%d, %s) failed due to constraint, ignoring",
+						mboxId, messageId)
+					continue
+				}
+
+				return fmt.Errorf("Inserting record into mailbox: %w", err)
 			}
 		}
-	}
 
-	tx.Commit()
-	return nil
-
-out_rollback:
-	tx.Rollback()
-	return err
+		return nil
+	})
 }

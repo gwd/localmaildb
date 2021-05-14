@@ -1,12 +1,14 @@
 package localmaildb
 
 import (
-	"database/sql"
 	"fmt"
-	"github.com/emersion/go-imap"
 	"log"
 	"sort"
 	"time"
+
+	"github.com/emersion/go-imap"
+	"github.com/jmoiron/sqlx"
+	"gitlab.com/martyros/sqlutil/txutil"
 )
 
 type MessageTree struct {
@@ -17,7 +19,7 @@ type MessageTree struct {
 }
 
 // "Standard" code to scan a message row
-func scanMessage(rows *sql.Rows) (*MessageTree, error) {
+func scanMessage(rows *sqlx.Rows) (*MessageTree, error) {
 	message := &MessageTree{}
 
 	var dateSeconds int64
@@ -39,7 +41,7 @@ func scanMessage(rows *sql.Rows) (*MessageTree, error) {
 	return message, nil
 }
 
-func scanMessageList(rows *sql.Rows) ([]*MessageTree, error) {
+func scanMessageList(rows *sqlx.Rows) ([]*MessageTree, error) {
 	messages := []*MessageTree{}
 
 	for rows.Next() {
@@ -57,18 +59,19 @@ func scanMessageList(rows *sql.Rows) ([]*MessageTree, error) {
 	return messages, nil
 }
 
-// FIXME:
-func (mdb *MailDB) GetMessageRoots() ([]*MessageTree, error) {
-	mboxid := mdb.mailbox.mailboxId
-	// FIXME
-	if mboxid == 0 {
-		return nil, fmt.Errorf("No mailbox id!")
-	}
+func (mdb *MailDB) GetMessageRoots(mailboxname string) ([]*MessageTree, error) {
+	var messages []*MessageTree
 
-	// Find all messages in the inbox.
-	// Find the "roots" of all these trees
-	// Return them.
-	rows, err := mdb.db.Query(`
+	err := txutil.TxLoopDb(mdb.db, func(eq sqlx.Ext) error {
+		mboxid, err := mailboxNameToIdTx(eq, mailboxname)
+		if err != nil {
+			return err
+		}
+
+		// Find all messages in the inbox.
+		// Find the "roots" of all these trees
+		// Return them.
+		rows, err := eq.Queryx(`
         WITH RECURSIVE
             ancestor(messageid) AS
                 (select messageid 
@@ -83,13 +86,18 @@ func (mdb *MailDB) GetMessageRoots() ([]*MessageTree, error) {
                 on self.inreplyto = parent.messageid
         where self.messageid in ancestor
               and IFNULL(parent.messageid, TRUE)`, mboxid)
-	if err != nil {
-		log.Printf("Error getting 'root' message list: %v", err)
-		return nil, err
-	}
-	defer rows.Close()
+		if err != nil {
+			return fmt.Errorf("Error getting 'root' message list: %w", err)
+		}
+		defer rows.Close()
 
-	messages, err := scanMessageList(rows)
+		messages, err = scanMessageList(rows)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
 
 	if err != nil {
 		return nil, err
@@ -100,14 +108,13 @@ func (mdb *MailDB) GetMessageRoots() ([]*MessageTree, error) {
 
 func (mdb *MailDB) GetTree(root *MessageTree) error {
 	// Get all messages in-reply-to the root
-	rows, err := mdb.db.Query(`
+	rows, err := mdb.db.Queryx(`
         select messageid, subject, date, message
             from lmdb_messages where inreplyto = $messageid`,
 		root.Envelope.MessageId)
 	if err != nil {
-		log.Printf("Error getting reply message list for messageid %s: %v",
+		return fmt.Errorf("Getting reply message list for messageid %s: %w",
 			root.Envelope.MessageId, err)
-		return err
 	}
 	defer rows.Close()
 
