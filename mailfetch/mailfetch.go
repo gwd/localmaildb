@@ -1,7 +1,7 @@
 package main
 
 import (
-	lmdb "github.com/gwd/localmaildb"
+	lmdb "github.com/gwd/localmaildb/localmaildb"
 	"github.com/spf13/viper"
 	"log"
 )
