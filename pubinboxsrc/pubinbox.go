@@ -49,6 +49,7 @@ func (src *PublicInboxSrc) Fetch(mdb *lmdb.MailDB) error {
 
 	lastMsg := time.Now()
 	count := 0
+	skipped := 0
 	log.Printf("Fetching messages...")
 
 	// Entries are already sorted; work backwards
@@ -90,7 +91,7 @@ func (src *PublicInboxSrc) Fetch(mdb *lmdb.MailDB) error {
 		err = iter.ForEach(func(c *object.Commit) error {
 			if time.Now().Sub(lastMsg) > time.Second*3 {
 				lastMsg = time.Now()
-				log.Printf("...added %d mails", count)
+				log.Printf("...added %d mails (%d skipped)", count, skipped)
 			}
 
 			// Check out this version
@@ -108,14 +109,19 @@ func (src *PublicInboxSrc) Fetch(mdb *lmdb.MailDB) error {
 
 			// Try to add it to the maildb
 			err = mdb.AddMessage(rawmail)
-			if err != nil && !errors.Is(err, lmdb.ErrMsgidPresent) {
+			switch {
+			case err == nil:
+				count++
+				return nil
+			case errors.Is(err, lmdb.ErrMsgidPresent):
+				return err
+			case errors.Is(err, lmdb.ErrParseError):
+				skipped++
+				return nil
+			default:
 				fmt.Println(string(rawmail))
 				return fmt.Errorf("Adding message to database: %w", err)
 			}
-
-			count++
-
-			return nil
 		})
 
 		if err != nil {
@@ -129,7 +135,7 @@ func (src *PublicInboxSrc) Fetch(mdb *lmdb.MailDB) error {
 		}
 	}
 
-	log.Printf("Added %d messages", count)
+	log.Printf("Added %d messages (%d skipped)", count, skipped)
 
 	return nil
 }

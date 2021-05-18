@@ -2,10 +2,11 @@ package localmaildb
 
 import (
 	"bytes"
-	"errors"
+	//"errors"
 	"fmt"
 	"log"
 	"net/mail"
+
 	"regexp"
 
 	"github.com/jmoiron/sqlx"
@@ -303,14 +304,60 @@ func mailAddressToOurAddress(in []*mail.Address) ([]Address, error) {
 
 // FIXME: Make a separate type for this and implement Is, so that
 // we can specify which message id was present.
-var ErrMsgidPresent = errors.New("Msgid Present")
+
+type Errno int
+
+const (
+	ErrMsgidPresent = Errno(iota)
+	ErrParseError
+)
+
+var errMessage = []string{
+	ErrMsgidPresent: "Message ID Present",
+	ErrParseError:   "Parsing message",
+}
+
+func (e Errno) Error() string {
+	if int(e) < len(errMessage) {
+		return errMessage[e]
+	}
+	return ""
+}
+
+func (e Errno) wrap(t error) Error {
+	return Error{Code: e, Suberror: t}
+}
+
+type Error struct {
+	Code     Errno
+	Suberror error
+}
+
+func (e Error) Unwrap() error {
+	return e.Suberror
+}
+
+func (e Error) Is(target error) bool {
+	switch t := target.(type) {
+	case Errno:
+		return t == e.Code
+	case Error:
+		return t.Code == e.Code
+	default:
+		return false
+	}
+}
+
+func (e Error) Error() string {
+	return fmt.Sprintf("%s: %v", e.Code.Error(), e.Suberror)
+}
 
 func (mdb *MailDB) AddMessage(message []byte) error {
 	db := mdb.db
 
 	m, err := mail.ReadMessage(bytes.NewReader(message))
 	if err != nil {
-		return fmt.Errorf("Parsing message as a mail: %w", err)
+		return ErrParseError.wrap(err)
 	}
 
 	envelope := map[HeaderPart][]Address{}
@@ -324,8 +371,8 @@ func (mdb *MailDB) AddMessage(message []byte) error {
 			if err == mail.ErrHeaderNotPresent {
 				continue
 			}
-			return fmt.Errorf("Getting address list for field %s: %w",
-				fieldName, err)
+			return ErrParseError.wrap(fmt.Errorf("Getting address list for field %s: %w",
+				fieldName, err))
 		}
 
 		envelope[HeaderPart(part)], err = mailAddressToOurAddress(theiraddr)
@@ -339,7 +386,7 @@ func (mdb *MailDB) AddMessage(message []byte) error {
 	subject := m.Header.Get("Subject")
 	date, err := m.Header.Date()
 	if err != nil {
-		return fmt.Errorf("Parsing message date: %w", err)
+		return ErrParseError.wrap(fmt.Errorf("Parsing message date: %w", err))
 	}
 
 	err = txutil.TxLoopDb(db, func(eq sqlx.Ext) error {
@@ -372,7 +419,7 @@ func (mdb *MailDB) AddMessage(message []byte) error {
 			message, inReplyTo, len(message))
 		if err != nil {
 			if liteutil.IsErrorConstraintUnique(err) {
-				return ErrMsgidPresent
+				return ErrMsgidPresent.wrap(fmt.Errorf("Inserting messageid %s: %w", messageId, err))
 			} else {
 				return fmt.Errorf("Inserting message: %w", err)
 			}
