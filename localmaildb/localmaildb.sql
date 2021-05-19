@@ -10,7 +10,7 @@ create table if not exists lmdb_params(
 create table if not exists lmdb_messages(
     messageid text primary key,
     subject   text not null,
-    date      integer  not null, /* Unix seconds. FIXME: Use time marshaling (retains TZ) */
+    date      date  not null,
     message   text not null,
     inreplyto text,
     size      integer  not null);
