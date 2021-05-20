@@ -39,13 +39,6 @@ func Connect(info PublicInboxInfo) (*PublicInboxSrc, error) {
 	return src, nil
 }
 
-// Message ids are *supposed* be unique, but they may not be; in
-// particular, if git send-email is run in several times in a row from
-// a script, duplicate message-ids may be generated.  Don't stop
-// processing until we've hit a certain number of consecutive existing
-// message IDs in a row.
-const maxConsecutiveMsgids = 10
-
 // For now we don't do any cloning or fetching; just start at he head
 // and work backwards until we find a messageid we've seen before
 func (src *PublicInboxSrc) Fetch(mdb *lmdb.MailDB) error {
@@ -57,7 +50,6 @@ func (src *PublicInboxSrc) Fetch(mdb *lmdb.MailDB) error {
 	lastMsg := time.Now()
 	count := 0
 	skipped := 0
-	msgidExists := 0
 	log.Printf("Fetching messages...")
 
 	// Entries are already sorted; work backwards
@@ -123,18 +115,16 @@ func (src *PublicInboxSrc) Fetch(mdb *lmdb.MailDB) error {
 			case err == nil:
 				count++
 				repoCount++
-				msgidExists = 0
 				return nil
 			case errors.Is(err, lmdb.ErrMsgidPresent):
-				msgidExists++
-				if msgidExists > maxConsecutiveMsgids {
-					log.Printf("%d MessageIDs present, stopping processing (%v)", msgidExists, err)
-					return err
-				}
+				// Unfortunately, the publix-inbox archive for
+				// xen-devel has duplicate mails for 2019 April 4 -
+				// June 4, so we can't use MsgidPresent to detect
+				// where we've gotten to at all.  We'll have to use
+				// the git head when updating.
 				skipped++
 				return nil
 			case errors.Is(err, lmdb.ErrParseError):
-				// Don't reset msgidExists here
 				skipped++
 				return nil
 			default:
