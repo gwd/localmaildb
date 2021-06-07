@@ -8,7 +8,7 @@ create table if not exists person(
     persondesc  text           /* Anything useful to distinguish this person from someone else w/ the same name */
 );
 
-create table if not exists company(
+create table if not exists companies(
     companyid   integer primary key,
     companyname text not null,
     companydesc text
@@ -22,17 +22,17 @@ create table if not exists hostname_to_company(
     hostname    text not null,
     companyid   integer not null,
     unique(hostname),
-    foreign key(companyid) references company
+    foreign key(companyid) references companies
 );
 
 create table if not exists person_to_company(
     personid  integer not null,
     companyid integer not null,
-    startdate date,
-    enddate   date,
+    startdate date, /* NULL here means 'for as  long as we know' */
+    enddate   date, /* NULL here means "currently" */
     unique(personid, companyid, startdate, enddate),
     foreign key(personid) references person,
-    foreign key(companyid) references company
+    foreign key(companyid) references companies
 );
 
 create table if not exists idmap.address_to_person(
@@ -73,4 +73,87 @@ insert into idmap.address_to_tag(mailboxname, hostname, tagid)
         left join (select tagid
 	          from idmap.tags
 		  where tagname='bot');
+
+/* Map people to known companies at a specific date */
+select personname, companyname
+  from person
+    natural join person_to_company
+    natural join companies
+  where '2017-02-23' between IFNULL(startdate, '0000-01-01') and IFNULL(enddate, '9999-12-31');
+
+select personname,
+       (case when '2017-02-23' between IFNULL(startdate, '0000-01-01') and IFNULL(enddate, '9999-12-31') then companyname end)
+  from person
+    natural join person_to_company
+    natural join companies;
+
+/* Map an email address to a company if no hostname matches */
+select distinct mailboxname, hostname, startdate, enddate
+  from lmdb_addresses
+    natural join address_to_person
+    natural join person
+    natural join person_to_company
+    natural join companies
+  where hostname not in (select hostname from hostname_to_company);
+  
+/* 
+ * Map <address, date> to a company using hostname if available; falling back to personal work
+ * map; falling back to 'unknown'.   
+ */
+with annotated_messages as
+  (select *, coalesce(hostcompany, max(personcompany), 'Unknown') as companyname
+    from (
+      select *,
+        case when date between IFNULL(startdate, '0000-01-01') and IFNULL(enddate, '9999-12-31') then personcompanyinner end as personcompany
+      from lmdb_messages
+        natural join lmdb_envelopejoin
+        natural join lmdb_addresses
+        left natural join (
+          select hostname, companyname as hostcompany
+            from hostname_to_company natural join companies)
+        left natural join (
+          select mailboxname, hostname, startdate, enddate, companyname as personcompanyinner
+            from address_to_person
+	      natural join person
+	      natural join person_to_company
+	      natural join companies))
+    where envelopepart=1
+    group by messageid)
+select messageid, mailboxname, hostname, date, companyname
+  from annotated_messages
+  order by random()
+  limit 30;
+
+/*
+ * Addresses not linked to a company (either by hostname or person), ordered by volume
+ */
+
+with annotated_messages as
+  (select *, coalesce(hostcompany, max(personcompany), 'Unknown') as companyname
+    from (
+      select *,
+        case when date between IFNULL(startdate, '0000-01-01') and IFNULL(enddate, '9999-12-31') then personcompanyinner end as personcompany
+      from lmdb_messages
+        natural join lmdb_envelopejoin
+        natural join lmdb_addresses
+        left natural join (
+          select hostname, companyname as hostcompany
+            from hostname_to_company natural join companies)
+        left natural join (
+          select mailboxname, hostname, startdate, enddate, companyname as personcompanyinner
+            from address_to_person
+	      natural join person
+	      natural join person_to_company
+	      natural join companies))
+    where envelopepart=1
+    group by messageid)
+select personalname, mailboxname || '@' || hostname as address, count(*) as n
+  from annotated_messages
+  where companyname='Unknown'
+  group by address
+  order by n desc
+  limit 50;
+
+
+/* SCRATCH */
 
