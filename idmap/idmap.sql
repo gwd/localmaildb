@@ -2,13 +2,13 @@
  * Mapping emails to people and companies
  ****************************************/
 
-create table if not exists person(
+create table if not exists idmap.person(
     personid    integer primary key,
     personname  text not null, /* "Canonical" name for the person.  Might not be unique. */
     persondesc  text           /* Anything useful to distinguish this person from someone else w/ the same name */
 );
 
-create table if not exists companies(
+create table if not exists idmap.companies(
     companyid   integer primary key,
     companyname text not null,
     companydesc text
@@ -18,14 +18,14 @@ create table if not exists companies(
  * This should only be used where the email address reliable indicates employer;
  * e.g., citrix.com -> Citrix, but gmail.com !-> Google.
  */
-create table if not exists hostname_to_company(
+create table if not exists idmap.hostname_to_company(
     hostname    text not null,
     companyid   integer not null,
     unique(hostname),
     foreign key(companyid) references companies
 );
 
-create table if not exists person_to_company(
+create table if not exists idmap.person_to_company(
     personid  integer not null,
     companyid integer not null,
     startdate date, /* NULL here means 'for as  long as we know' */
