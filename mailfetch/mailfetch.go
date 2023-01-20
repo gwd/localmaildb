@@ -68,7 +68,13 @@ func main() {
 		log.Fatalf("Error creating mailbox: %v", err)
 	}
 
-	if len(os.Args) < 2 {
+	cmd := "fetch"
+	if len(os.Args) >= 2 {
+		cmd = os.Args[1]
+	}
+
+	switch cmd {
+	case "fetch":
 		log.Println("Opening imap connection")
 		if err = src.ImapConnect(); err != nil {
 			log.Fatalf("Connecting to the IMAP server: %v", err)
@@ -77,7 +83,22 @@ func main() {
 		if err = src.Fetch(mdb); err != nil {
 			log.Fatalf("Fetching mail: %v", err)
 		}
-	} else {
+	case "list-threads":
+		log.Println("Getting message roots")
+		messages, err := mdb.GetMessageRoots(mailbox.MailboxName)
+		if err != nil {
+			log.Fatalf("Getting message roots: %v", err)
+		}
+
+		for _, message := range messages {
+			log.Printf("%v | %v | %v", message.Envelope.MessageId, message.Envelope.Date, message.Envelope.Subject)
+		}
+	case "list-thread":
+		if len(os.Args) < 3 {
+			log.Fatalf("Not enough arguments to %s", cmd)
+		}
+		tgtMessageId := os.Args[2]
+
 		log.Println("Getting message roots")
 		messages, err := mdb.GetMessageRoots(mailbox.MailboxName)
 		if err != nil {
@@ -85,7 +106,6 @@ func main() {
 		}
 
 		var tgtMessage *lmdb.MessageTree
-		tgtMessageId := "<example>"
 		for _, message := range messages {
 			log.Printf("%v | %v", message.Envelope.Date, message.Envelope.Subject)
 
@@ -101,6 +121,7 @@ func main() {
 		}
 
 		TreePrint(tgtMessage, "")
-
+	default:
+		log.Fatalf("Unknown command %s", cmd)
 	}
 }
