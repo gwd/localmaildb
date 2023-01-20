@@ -22,7 +22,7 @@ type MessageTree struct {
 func scanMessage(rows *sqlx.Rows) (*MessageTree, error) {
 	message := &MessageTree{}
 
-	var dateSeconds int64
+	var dateSeconds time.Time
 	var messageString string
 
 	err := rows.Scan(&message.Envelope.MessageId,
@@ -34,7 +34,7 @@ func scanMessage(rows *sqlx.Rows) (*MessageTree, error) {
 		return nil, err
 	}
 
-	message.Envelope.Date = time.Unix(dateSeconds, 0)
+	message.Envelope.Date = dateSeconds
 	message.Latest = message.Envelope.Date
 	message.RawMessage = []byte(messageString)
 

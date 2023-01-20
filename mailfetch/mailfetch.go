@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"os"
 
 	"github.com/spf13/viper"
 
@@ -67,7 +68,7 @@ func main() {
 		log.Fatalf("Error creating mailbox: %v", err)
 	}
 
-	if true {
+	if len(os.Args) < 2 {
 		log.Println("Opening imap connection")
 		if err = src.ImapConnect(); err != nil {
 			log.Fatalf("Connecting to the IMAP server: %v", err)
