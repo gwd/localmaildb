@@ -1,9 +1,12 @@
 package main
 
 import (
-	lmdb "github.com/gwd/localmaildb/localmaildb"
-	"github.com/spf13/viper"
 	"log"
+
+	"github.com/spf13/viper"
+
+	imapsrc "github.com/gwd/localmaildb/imapsource"
+	lmdb "github.com/gwd/localmaildb/localmaildb"
 )
 
 func TreePrint(message *lmdb.MessageTree, indent string) {
@@ -14,7 +17,7 @@ func TreePrint(message *lmdb.MessageTree, indent string) {
 }
 
 func main() {
-	mailbox := lmdb.MailboxInfo{}
+	mailbox := imapsrc.MailboxInfo{}
 
 	viper.SetConfigName(".taskmail")
 	viper.AddConfigPath(".")
@@ -47,25 +50,35 @@ func main() {
 	}
 	mailbox.Password = viper.GetString("password")
 
+	var src imapsrc.ImapSource
+	if src, err = imapsrc.Setup(&mailbox); err != nil {
+		log.Fatalf("Error setting up imap source: %v", err)
+	}
+
 	log.Println("Opening database")
-	mdb, err := lmdb.OpenMailDB("maildb.sqlite", &mailbox)
+	mdb, err := lmdb.OpenMailDB("maildb.sqlite")
 	if err != nil {
 		log.Fatalf("Error opening database: %v", err)
 	}
 	defer mdb.Close()
 
-	if false {
+	// FIXME: Eventually we want this done explicitly as part of an 'init' or 'create' step.
+	if err := mdb.CreateMailbox(mailbox.MailboxName); err != nil {
+		log.Fatalf("Error creating mailbox: %v", err)
+	}
+
+	if true {
 		log.Println("Opening imap connection")
-		if err = mdb.ImapConnect(); err != nil {
+		if err = src.ImapConnect(); err != nil {
 			log.Fatalf("Connecting to the IMAP server: %v", err)
 		}
 
-		if err = mdb.Fetch(); err != nil {
+		if err = src.Fetch(mdb); err != nil {
 			log.Fatalf("Fetching mail: %v", err)
 		}
 	} else {
 		log.Println("Getting message roots")
-		messages, err := mdb.GetMessageRoots()
+		messages, err := mdb.GetMessageRoots(mailbox.MailboxName)
 		if err != nil {
 			log.Fatalf("Getting message roots: %v", err)
 		}

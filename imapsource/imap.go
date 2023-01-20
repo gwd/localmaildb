@@ -1,14 +1,15 @@
-package localmaildb
+package imapsource
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"time"
 
-	"github.com/jmoiron/sqlx"
-
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
+
+	lmdb "github.com/gwd/localmaildb/localmaildb"
 )
 
 type UpdateStrategy int
@@ -24,7 +25,6 @@ type MailboxInfo struct {
 	Hostname, Username, Password string
 	Port                         int
 	UpdateWindow                 time.Duration
-	mailboxId                    int // ID in database
 }
 
 type ImapSource struct {
@@ -43,16 +43,20 @@ func (isrc *ImapSource) Close() {
 	}
 }
 
-func (mdb *ImapSource) ImapConnect() error {
-	imapinfo := &mdb.mailbox
+func Setup(mbi *MailboxInfo) (ImapSource, error) {
+	return ImapSource{mailbox: *mbi}, nil
+}
+
+func (src *ImapSource) ImapConnect() error {
+	imapinfo := &src.mailbox
 
 	if imapinfo.Hostname == "" {
 		return fmt.Errorf("IMAP dial info not set up")
 	}
 
-	if mdb.client != nil {
+	if src.client != nil {
 		// We already seem to have a connection -- see if it's still alive
-		err := mdb.client.Noop()
+		err := src.client.Noop()
 		if err == nil {
 			return nil
 		}
@@ -81,18 +85,23 @@ func (mdb *ImapSource) ImapConnect() error {
 		return fmt.Errorf("Logging in to IMAP server: %v", err)
 	}
 
-	_, err = c.Select("INBOX", false)
+	mbox := imapinfo.MailboxName
+	if mbox == "" {
+		mbox = "INBOX"
+	}
+
+	_, err = c.Select(mbox, false)
 	if err != nil {
 		return err
 	}
 
-	mdb.client = c
+	src.client = c
 
 	return nil
 }
 
 type fetchReq struct {
-	mdb      MailDb
+	mdb      *lmdb.MailDB
 	seqset   *imap.SeqSet
 	items    []imap.FetchItem
 	messages chan *imap.Message
@@ -100,26 +109,26 @@ type fetchReq struct {
 }
 
 // Start a go routine for handling fetch requests.  Close the returned channel when done.
-func (mdb *ImapSource) goFetch() chan *fetchReq {
-	mdb.fetchreq = make(chan *fetchReq, 10)
+func (src *ImapSource) goFetch() chan *fetchReq {
+	src.fetchreq = make(chan *fetchReq, 10)
 	go func() {
-		c := mdb.client
-		fetchreq := mdb.fetchreq
+		c := src.client
+		fetchreq := src.fetchreq
 		for req := range fetchreq {
 			log.Printf("fetcher: Making request [%p]", req)
 			req.done <- c.Fetch(req.seqset, req.items, req.messages)
 		}
 	}()
-	return mdb.fetchreq
+	return src.fetchreq
 }
 
-func (mdb *ImapSource) goFetchClose() {
-	close(mdb.fetchreq)
-	mdb.fetchreq = nil
+func (src *ImapSource) goFetchClose() {
+	close(src.fetchreq)
+	src.fetchreq = nil
 }
 
-func (mdb *ImapSource) goFetchEnvelopeBatches(Messages uint32) (chan chan error, chan []string) {
-	mdb.bodyStatusChan = make(chan chan error, 1)
+func (src *ImapSource) goFetchEnvelopeBatches(mdb *lmdb.MailDB, Messages uint32) (chan chan error, chan []string) {
+	src.bodyStatusChan = make(chan chan error, 1)
 	messageIds := make(chan []string, 1)
 
 	go func() {
@@ -136,8 +145,8 @@ func (mdb *ImapSource) goFetchEnvelopeBatches(Messages uint32) (chan chan error,
 				messages := <-envelopeBatch
 				allMessages = append(allMessages, messages...)
 			}
-			close(mdb.bodyStatusChan)
-			mdb.bodyStatusChan = nil
+			close(src.bodyStatusChan)
+			src.bodyStatusChan = nil
 			messageIds <- allMessages
 			close(messageIds)
 		}()
@@ -154,7 +163,7 @@ func (mdb *ImapSource) goFetchEnvelopeBatches(Messages uint32) (chan chan error,
 				to = Messages
 			}
 
-			envreq := new(fetchReq)
+			envreq := &fetchReq{mdb: mdb}
 
 			envreq.seqset = new(imap.SeqSet)
 			envreq.seqset.AddRange(from, to)
@@ -166,11 +175,11 @@ func (mdb *ImapSource) goFetchEnvelopeBatches(Messages uint32) (chan chan error,
 
 			log.Printf("[%p] Reqesting envelopes (%d, %d)", envreq, from, to)
 
-			mdb.fetchreq <- envreq
+			src.fetchreq <- envreq
 
 			envelopeBatch := make(chan []string, 1)
 
-			go mdb.goProcessEnvelopeBatch(envreq, envelopeBatch)
+			go src.goProcessEnvelopeBatch(envreq, envelopeBatch)
 
 			envelopeBatchChan <- envelopeBatch
 
@@ -181,11 +190,11 @@ func (mdb *ImapSource) goFetchEnvelopeBatches(Messages uint32) (chan chan error,
 		close(envelopeBatchChan)
 	}()
 
-	return mdb.bodyStatusChan, messageIds
+	return src.bodyStatusChan, messageIds
 }
 
 // Go routine to process the outcome of the message
-func (mdb *ImapSource) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch chan []string) {
+func (src *ImapSource) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch chan []string) {
 	messages := []string{}
 
 	// cmsg: Message to check
@@ -193,7 +202,7 @@ func (mdb *ImapSource) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch ch
 	// bmsg: Message from body
 	for cmsg := range envreq.messages {
 		messages = append(messages, cmsg.Envelope.MessageId)
-		if prs, err := mdb.IsMsgIdPresent(cmsg.Envelope.MessageId); err != nil {
+		if prs, err := envreq.mdb.IsMsgIdPresent(cmsg.Envelope.MessageId); err != nil {
 			// FIXME: Not clear what the best thing would be to do
 			// here.
 			log.Fatalf("Checking message presence in database: %v", err)
@@ -204,9 +213,9 @@ func (mdb *ImapSource) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch ch
 
 		bodyStatus := make(chan error, 1)
 
-		go mdb.goProcessBody(cmsg, bodyStatus)
+		go src.goProcessBody(envreq, cmsg, bodyStatus)
 
-		mdb.bodyStatusChan <- bodyStatus
+		src.bodyStatusChan <- bodyStatus
 	}
 
 	err := envreq.done
@@ -217,7 +226,7 @@ func (mdb *ImapSource) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch ch
 	envelopeBatch <- messages
 }
 
-func (mdb *ImapSource) goProcessBody(envreq *fetchReq, emsg *imap.Message, bodyStatus chan error) {
+func (src *ImapSource) goProcessBody(envreq *fetchReq, emsg *imap.Message, bodyStatus chan error) {
 	// Request a single message
 	bodyreq := new(fetchReq)
 	bodyreq.seqset = new(imap.SeqSet)
@@ -231,12 +240,12 @@ func (mdb *ImapSource) goProcessBody(envreq *fetchReq, emsg *imap.Message, bodyS
 	log.Printf("[%p] Fetching message %s (%s)", bodyreq,
 		emsg.Envelope.MessageId, emsg.Envelope.Subject)
 
-	mdb.fetchreq <- bodyreq
+	src.fetchreq <- bodyreq
 
 	// Wait for the response
 	bmsg := <-bodyreq.messages
 
-	log.Printf("Processing body %v", bmsg.Envelope.MessageId)
+	log.Printf("Processing body %v", emsg.Envelope.MessageId)
 
 	// Process
 	if bmsg.SeqNum != emsg.SeqNum {
@@ -258,8 +267,11 @@ func (mdb *ImapSource) goProcessBody(envreq *fetchReq, emsg *imap.Message, bodyS
 		bodyStatus <- fmt.Errorf("No literals in message body")
 		return
 	}
-	if err := envreq.mdb.AddMessage(bmsg.Envelope, body); err != nil {
-		bodyStatus <- fmt.Errorf("Adding message to database: %v", err)
+	if message, err := io.ReadAll(body); err != nil {
+		bodyStatus <- fmt.Errorf("Error reading body: %w", err)
+		return
+	} else if err := envreq.mdb.AddMessage(message); err != nil {
+		bodyStatus <- fmt.Errorf("Adding message to database: %w", err)
 		return
 	}
 
@@ -267,7 +279,7 @@ func (mdb *ImapSource) goProcessBody(envreq *fetchReq, emsg *imap.Message, bodyS
 }
 
 // Fetch mail from ImapSource and put it into mdb
-func (src *ImapSource) Fetch(mdb MailDB) error {
+func (src *ImapSource) Fetch(mdb *lmdb.MailDB) error {
 	// Connect or check the connection
 	err := src.ImapConnect()
 	if err != nil {
@@ -290,7 +302,7 @@ func (src *ImapSource) Fetch(mdb MailDB) error {
 	defer src.goFetchClose()
 
 	// Fetch envelopes in batches of 50, closing once they're all gone.
-	bodyStatusChan, messageIdChan := src.goFetchEnvelopeBatches(status.Messages)
+	bodyStatusChan, messageIdChan := src.goFetchEnvelopeBatches(mdb, status.Messages)
 
 	log.Printf("Waiting for body processing statuses")
 	for bodyStatus := range bodyStatusChan {
@@ -305,7 +317,9 @@ func (src *ImapSource) Fetch(mdb MailDB) error {
 
 	log.Printf("Inbox contains %d messages", len(messageIds))
 
-	mdb.UpdateMailbox(messageIds)
+	if err := mdb.UpdateMailbox(src.mailbox.MailboxName, messageIds); err != nil {
+		return err
+	}
 
 	log.Printf("Done!")
 

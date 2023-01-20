@@ -52,7 +52,7 @@ type MailDB struct {
 func mailboxNameToIdTx(eq sqlx.Ext, mailboxname string) (int, error) {
 	var mailboxId int
 	log.Printf("Looking up mailbox %s", mailboxname)
-	err := sqlx.Get(eq, &mailboxId, `select mailboxid from lmdb_mailboxes where mailboxname = ?`,
+	err := sqlx.Get(eq, &mailboxId, `select mailboxid from lmdb_mailboxes where mailboxname=?`,
 		mailboxname)
 	if err != nil {
 		return 0, err
@@ -65,7 +65,7 @@ func mailboxNameToIdTx(eq sqlx.Ext, mailboxname string) (int, error) {
 func (mdb *MailDB) CreateMailbox(mailboxname string) error {
 	_, err := mdb.db.Exec(`insert into lmdb_mailboxes(mailboxname) values(?)`,
 		mailboxname)
-	if err != nil {
+	if err != nil && !liteutil.IsErrorConstraintUnique(err) {
 		return fmt.Errorf("Inserting mailbox id: %w", err)
 	}
 	return nil
@@ -443,8 +443,10 @@ func (mdb *MailDB) UpdateMailbox(mailboxname string, messageIds []string) error 
 	return txutil.TxLoopDb(mdb.db, func(eq sqlx.Ext) error {
 		mboxId, err := mailboxNameToIdTx(eq, mailboxname)
 		if err != nil || mboxId == 0 {
-			return fmt.Errorf("Couldn't get mailbox Id!")
+			return fmt.Errorf("Couldn't get mailbox id for mailbox %s!", mailboxname)
 		}
+
+		log.Printf("Mailbox ID for mailboxname %s: %d", mailboxname, mboxId)
 
 		// First, delete all rows for this mailbox
 		_, err = eq.Exec(`delete from lmdb_mailbox_join where mailboxid = ?`, mboxId)
