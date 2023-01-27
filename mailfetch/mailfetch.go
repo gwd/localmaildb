@@ -1,10 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 
 	"github.com/spf13/viper"
+
+	"github.com/emersion/go-mbox"
 
 	imapsrc "github.com/gwd/localmaildb/imapsource"
 	lmdb "github.com/gwd/localmaildb/localmaildb"
@@ -14,6 +17,25 @@ func TreePrint(message *lmdb.MessageTree, indent string) {
 	log.Printf("%s %v %s", indent, message.Envelope.Date, message.Envelope.Subject)
 	for _, reply := range message.Replies {
 		TreePrint(reply, indent+"*")
+	}
+
+}
+
+// Things to handle:
+// - Only a single email, top-level has [PATCH] (or [PATCH v2])
+// - Thread with [0/N] at the top
+// - Thread with [1/N] at the top
+func TreeAm(tree *lmdb.MessageTree) {
+	mbw := mbox.NewWriter(os.Stdout)
+
+	for _, reply := range tree.Replies {
+		log.Printf("Envelope: %v", reply.Envelope)
+		mbfrom := fmt.Sprintf("%s@%s", reply.Envelope.From[0].MailboxName, reply.Envelope.From[0].HostName)
+		if w, err := mbw.CreateMessage(mbfrom, reply.Envelope.Date); err != nil {
+			log.Fatalf("Creating message in mbox: %v", err)
+		} else if _, err := w.Write(reply.RawMessage); err != nil {
+			log.Fatalf("Writing message to mbox: %v", err)
+		}
 	}
 }
 
@@ -121,6 +143,35 @@ func main() {
 		}
 
 		TreePrint(tgtMessage, "")
+	case "export-am":
+		if len(os.Args) < 3 {
+			log.Fatalf("Not enough arguments to %s", cmd)
+		}
+		tgtMessageId := os.Args[2]
+
+		log.Println("Getting message roots")
+		messages, err := mdb.GetMessageRoots(mailbox.MailboxName)
+		if err != nil {
+			log.Fatalf("Getting message roots: %v", err)
+		}
+
+		var tgtMessage *lmdb.MessageTree
+		for _, message := range messages {
+			log.Printf("%v | %v", message.Envelope.Date, message.Envelope.Subject)
+
+			if message.Envelope.MessageId == tgtMessageId {
+				tgtMessage = message
+			}
+		}
+
+		log.Printf("Getting message tree for messageid %s", tgtMessageId)
+		err = mdb.GetTree(tgtMessage)
+		if err != nil {
+			log.Fatalf("Getting message tree: %v", err)
+		}
+
+		TreeAm(tgtMessage)
+
 	default:
 		log.Fatalf("Unknown command %s", cmd)
 	}

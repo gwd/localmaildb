@@ -97,6 +97,8 @@ github.com/emersion/go-imap v1.1.0 h1:hAW8Dbi/AwiVO5Wi40FTVuCzVrTmwtEK6De9GSoOy+
 github.com/emersion/go-imap v1.1.0/go.mod h1:0hCeak4mA2z9hICM20jeqN6fyV0Oad0lZTyeeAyUS6o=
 github.com/emersion/go-imap v1.2.1 h1:+s9ZjMEjOB8NzZMVTM3cCenz2JrQIGGo5j1df19WjTA=
 github.com/emersion/go-imap v1.2.1/go.mod h1:Qlx1FSx2FTxjnjWpIlVNEuX+ylerZQNFE5NsmKFSejY=
+github.com/emersion/go-mbox v1.0.3 h1:Kac75r/EGi6KZAz48HXal9q7EiaXNl+U5HZfyDz0LKM=
+github.com/emersion/go-mbox v1.0.3/go.mod h1:Yp9IVuuOYLEuMv4yjgDHvhb5mHOcYH6x92Oas3QqEZI=
 github.com/emersion/go-message v0.14.1/go.mod h1:N1JWdZQ2WRUalmdHAX308CWBq747VJ8oUorFI3VCBwU=
 github.com/emersion/go-message v0.15.0/go.mod h1:wQUEfE+38+7EW8p8aZ96ptg6bAb1iwdgej19uXASlE4=
 github.com/emersion/go-sasl v0.0.0-20200509203442-7bfe0ed36a21 h1:OJyUGMJTzHTd1XQp98QTaHernxMYzRaOasRir9hUlFQ=

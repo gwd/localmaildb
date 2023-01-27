@@ -22,26 +22,24 @@ type MessageTree struct {
 func scanMessage(rows *sqlx.Rows) (*MessageTree, error) {
 	message := &MessageTree{}
 
-	var dateSeconds time.Time
 	var messageString string
 
 	err := rows.Scan(&message.Envelope.MessageId,
 		&message.Envelope.Subject,
-		&dateSeconds,
+		&message.Envelope.Date,
 		&messageString)
 
 	if err != nil {
 		return nil, err
 	}
 
-	message.Envelope.Date = dateSeconds
 	message.Latest = message.Envelope.Date
 	message.RawMessage = []byte(messageString)
 
 	return message, nil
 }
 
-func scanMessageList(rows *sqlx.Rows) ([]*MessageTree, error) {
+func scanMessageList(eq sqlx.Ext, rows *sqlx.Rows) ([]*MessageTree, error) {
 	messages := []*MessageTree{}
 
 	for rows.Next() {
@@ -53,8 +51,26 @@ func scanMessageList(rows *sqlx.Rows) ([]*MessageTree, error) {
 		messages = append(messages, message)
 	}
 
+	rows.Close()
+
 	// Sort by date order ascending
 	sort.Slice(messages, func(i, j int) bool { return messages[i].Envelope.Date.Before(messages[j].Envelope.Date) })
+
+	for i := range messages {
+		// FIXME: Do the rest of the header parts
+		message := messages[i]
+		err := sqlx.Select(eq, &message.Envelope.From, `
+		select personalname, mailboxname, hostname
+			from lmdb_messages 
+				natural join lmdb_envelopejoin
+				natural join lmdb_addresses
+			where messageid=?
+			  and envelopepart=?`, message.Envelope.MessageId, HeaderPartFrom)
+		if err != nil {
+			return nil, fmt.Errorf("Getting From envelope for messageid %s: %w",
+				message.Envelope.MessageId, err)
+		}
+	}
 
 	return messages, nil
 }
@@ -89,9 +105,8 @@ func (mdb *MailDB) GetMessageRoots(mailboxname string) ([]*MessageTree, error) {
 		if err != nil {
 			return fmt.Errorf("Error getting 'root' message list: %w", err)
 		}
-		defer rows.Close()
 
-		messages, err = scanMessageList(rows)
+		messages, err = scanMessageList(eq, rows)
 		if err != nil {
 			return err
 		}
@@ -106,9 +121,9 @@ func (mdb *MailDB) GetMessageRoots(mailboxname string) ([]*MessageTree, error) {
 	return messages, nil
 }
 
-func (mdb *MailDB) GetTree(root *MessageTree) error {
+func getTreeTx(eq sqlx.Ext, root *MessageTree) error {
 	// Get all messages in-reply-to the root
-	rows, err := mdb.db.Queryx(`
+	rows, err := eq.Queryx(`
         select messageid, subject, date, message
             from lmdb_messages where inreplyto = $messageid`,
 		root.Envelope.MessageId)
@@ -116,20 +131,23 @@ func (mdb *MailDB) GetTree(root *MessageTree) error {
 		return fmt.Errorf("Getting reply message list for messageid %s: %w",
 			root.Envelope.MessageId, err)
 	}
-	defer rows.Close()
 
-	root.Replies, err = scanMessageList(rows)
-	if err != nil {
+	if root.Replies, err = scanMessageList(eq, rows); err != nil {
 		return err
 	}
 
 	// And get all the messages for those
-	for _, messages := range root.Replies {
-		err = mdb.GetTree(messages)
-		if err != nil {
+	for _, message := range root.Replies {
+		if err := getTreeTx(eq, message); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+func (mdb *MailDB) GetTree(root *MessageTree) error {
+	return txutil.TxLoopDb(mdb.db, func(eq sqlx.Ext) error {
+		return getTreeTx(eq, root)
+	})
 }
