@@ -151,3 +151,35 @@ func (mdb *MailDB) GetTree(root *MessageTree) error {
 		return getTreeTx(eq, root)
 	})
 }
+
+func (mdb *MailDB) GetTreeFromMessageId(msgid string) (*MessageTree, error) {
+	var message *MessageTree
+
+	return message, txutil.TxLoopDb(mdb.db, func(eq sqlx.Ext) error {
+
+		rows, err := eq.Queryx(`
+        select self.messageid, self.subject, self.date, self.message
+            from lmdb_messages as self
+                left join lmdb_messages as parent
+                on self.inreplyto = parent.messageid
+        where self.messageid=?`, msgid)
+		if err != nil {
+			return fmt.Errorf("Error getting message with messageid %s: %w", msgid, err)
+		}
+
+		if messages, err := scanMessageList(eq, rows); err != nil {
+			return err
+		} else if len(messages) != 1 {
+			return fmt.Errorf("Unexpected number of messages found: %d", len(messages))
+		} else {
+			message = messages[0]
+		}
+
+		if err := getTreeTx(eq, message); err != nil {
+			return err
+		}
+
+		return nil
+
+	})
+}

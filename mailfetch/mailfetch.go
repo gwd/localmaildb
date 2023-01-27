@@ -121,23 +121,8 @@ func main() {
 		}
 		tgtMessageId := os.Args[2]
 
-		log.Println("Getting message roots")
-		messages, err := mdb.GetMessageRoots(mailbox.MailboxName)
-		if err != nil {
-			log.Fatalf("Getting message roots: %v", err)
-		}
-
-		var tgtMessage *lmdb.MessageTree
-		for _, message := range messages {
-			log.Printf("%v | %v", message.Envelope.Date, message.Envelope.Subject)
-
-			if message.Envelope.MessageId == tgtMessageId {
-				tgtMessage = message
-			}
-		}
-
 		log.Printf("Getting message tree for messageid %s", tgtMessageId)
-		err = mdb.GetTree(tgtMessage)
+		tgtMessage, err := mdb.GetTreeFromMessageId(tgtMessageId)
 		if err != nil {
 			log.Fatalf("Getting message tree: %v", err)
 		}
@@ -149,23 +134,8 @@ func main() {
 		}
 		tgtMessageId := os.Args[2]
 
-		log.Println("Getting message roots")
-		messages, err := mdb.GetMessageRoots(mailbox.MailboxName)
-		if err != nil {
-			log.Fatalf("Getting message roots: %v", err)
-		}
-
-		var tgtMessage *lmdb.MessageTree
-		for _, message := range messages {
-			log.Printf("%v | %v", message.Envelope.Date, message.Envelope.Subject)
-
-			if message.Envelope.MessageId == tgtMessageId {
-				tgtMessage = message
-			}
-		}
-
 		log.Printf("Getting message tree for messageid %s", tgtMessageId)
-		err = mdb.GetTree(tgtMessage)
+		tgtMessage, err := mdb.GetTreeFromMessageId(tgtMessageId)
 		if err != nil {
 			log.Fatalf("Getting message tree: %v", err)
 		}
