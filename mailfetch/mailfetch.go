@@ -21,24 +21,6 @@ func TreePrint(message *lmdb.MessageTree, indent string) {
 
 }
 
-// Things to handle:
-// - Only a single email, top-level has [PATCH] (or [PATCH v2])
-// - Thread with [0/N] at the top
-// - Thread with [1/N] at the top
-func TreeAm(tree *lmdb.MessageTree) {
-	mbw := mbox.NewWriter(os.Stdout)
-
-	for _, reply := range tree.Replies {
-		log.Printf("Envelope: %v", reply.Envelope)
-		mbfrom := fmt.Sprintf("%s@%s", reply.Envelope.From[0].MailboxName, reply.Envelope.From[0].HostName)
-		if w, err := mbw.CreateMessage(mbfrom, reply.Envelope.Date); err != nil {
-			log.Fatalf("Creating message in mbox: %v", err)
-		} else if _, err := w.Write(reply.RawMessage); err != nil {
-			log.Fatalf("Writing message to mbox: %v", err)
-		}
-	}
-}
-
 func main() {
 	mailbox := imapsrc.MailboxInfo{}
 
@@ -140,7 +122,19 @@ func main() {
 			log.Fatalf("Getting message tree: %v", err)
 		}
 
-		TreeAm(tgtMessage)
+		{
+			mt := lmdb.TreeFilterAm(tgtMessage)
+			mbw := mbox.NewWriter(os.Stdout)
+
+			for _, msg := range mt {
+				mbfrom := fmt.Sprintf("%s@%s", msg.Envelope.From[0].MailboxName, msg.Envelope.From[0].HostName)
+				if w, err := mbw.CreateMessage(mbfrom, msg.Envelope.Date); err != nil {
+					log.Fatalf("Creating message in mbox: %v", err)
+				} else if _, err := w.Write(msg.RawMessage); err != nil {
+					log.Fatalf("Writing message to mbox: %v", err)
+				}
+			}
+		}
 
 	default:
 		log.Fatalf("Unknown command %s", cmd)
