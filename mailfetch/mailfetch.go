@@ -127,6 +127,7 @@ func main() {
 			mbw := mbox.NewWriter(os.Stdout)
 
 			for _, msg := range mt {
+				log.Printf("Adding message %s", msg.Envelope.Subject)
 				mbfrom := fmt.Sprintf("%s@%s", msg.Envelope.From[0].MailboxName, msg.Envelope.From[0].HostName)
 				if w, err := mbw.CreateMessage(mbfrom, msg.Envelope.Date); err != nil {
 					log.Fatalf("Creating message in mbox: %v", err)
