@@ -3,7 +3,7 @@ package pubinboxsrc
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 	"path"
@@ -75,38 +75,44 @@ func (src *PublicInboxSrc) Fetch(mdb *lmdb.MailDB) error {
 
 		log.Printf("Processing directory %s, starting from revision %v", rpath, *starthash)
 
-		wt, err := repo.Worktree()
-		if err != nil {
-			return fmt.Errorf("Getting worktree: %w", err)
-		}
-
 		iter, err := repo.Log(&git.LogOptions{From: *starthash, Order: git.LogOrderBSF})
 		if err != nil {
 			return fmt.Errorf("Getting log iterator: %w", err)
 		}
 
 		// There's a single mail file in the repo called 'm'
-		mpath := path.Join(rpath, "m")
+		filename := "m"
 
 		repoCount := 0
 
 		err = iter.ForEach(func(c *object.Commit) error {
-			if time.Now().Sub(lastMsg) > time.Second*3 {
+			if time.Since(lastMsg) > time.Second*3 {
 				lastMsg = time.Now()
 				log.Printf("...added %d mails total, %d from this repo (%d skipped).  Current date %v", count, repoCount, skipped, c.Author.When)
 			}
 
-			// Check out this version
-			err := wt.Checkout(&git.CheckoutOptions{Hash: c.Hash})
+			// Get the tree for this commit
+			tree, err := c.Tree()
 			if err != nil {
-				return fmt.Errorf("Checking out revision %v: %w",
-					c.Hash, err)
+				return fmt.Errorf("Getting commit tree for revision %v: %w", c.Hash, err)
 			}
 
-			// Read the mail
-			rawmail, err := ioutil.ReadFile(mpath)
+			// Find the file in the tree
+			file, err := tree.File(filename)
 			if err != nil {
-				return fmt.Errorf("Reading file %s: %w", mpath, err)
+				return fmt.Errorf("Finding file %s in tree: %w", filename, err)
+			}
+
+			reader, err := file.Reader()
+			if err != nil {
+				return fmt.Errorf("Getting file reader for %s: %w", filename, err)
+			}
+			defer reader.Close()
+
+			// Read the mail
+			rawmail, err := io.ReadAll(reader)
+			if err != nil {
+				return fmt.Errorf("Reading file %s: %w", filename, err)
 			}
 
 			// Try to add it to the maildb
