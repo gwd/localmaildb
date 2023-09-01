@@ -16,9 +16,12 @@ const (
 )
 
 var rePatchMail = map[PatchMailType]*regexp.Regexp{
-	PatchMailSingleton: regexp.MustCompile(`^\[(RFC )?PATCH( RFC| v[0-9]+)*\]`),
+	// PatchMailSingleton: regexp.MustCompile(`^\[(RFC )?PATCH( RFC| v[0-9]+)*\]`),
+	// PatchMail0N:        regexp.MustCompile(`^\[(RFC )?PATCH( RFC| v[0-9]+)* 0+/[0-9]+\]`),
+	// PatchMailMN:        regexp.MustCompile(`^\[(RFC )?PATCH( RFC| v[0-9]+)* 0*[0-9]+0*/[0-9]+\]`),
 	PatchMail0N:        regexp.MustCompile(`^\[(RFC )?PATCH( RFC| v[0-9]+)* 0+/[0-9]+\]`),
 	PatchMailMN:        regexp.MustCompile(`^\[(RFC )?PATCH( RFC| v[0-9]+)* 0*[0-9]+0*/[0-9]+\]`),
+	PatchMailSingleton: regexp.MustCompile(`^\[(RFC )?PATCH(( RFC| v[0-9]+)*| [a-zA-Z-0-9]+)*\]`),
 }
 
 func SubjectDetectPatch(s string) PatchMailType {

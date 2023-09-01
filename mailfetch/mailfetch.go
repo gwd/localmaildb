@@ -126,6 +126,10 @@ func main() {
 			mt := lmdb.TreeFilterAm(tgtMessage)
 			mbw := mbox.NewWriter(os.Stdout)
 
+			if len(mt) < 1 {
+				log.Fatalf("No messages in thread after TreeFilterAm!")
+			}
+
 			for _, msg := range mt {
 				log.Printf("Adding message %s", msg.Envelope.Subject)
 				mbfrom := fmt.Sprintf("%s@%s", msg.Envelope.From[0].MailboxName, msg.Envelope.From[0].HostName)
