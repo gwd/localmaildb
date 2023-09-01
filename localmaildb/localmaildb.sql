@@ -176,25 +176,34 @@ select date, IFNULL(personname, mailboxname || "@" || hostname) as id, subject, 
   order by random()
   limit 20;
 
-select IFNULL(personname, mailboxname || "@" || hostname) as id, IFNULL(companyname, "Unknown") as company, count(*) as messages
+/* Messages sorted by email address, with personal name */
+with nonbot_addresses as
+  (select * from lmdb_addresses
+     left natural join
+       (select *
+          from idmap.address_to_tag
+	    natural join idmap.tags
+	    where tagname='bot')
+    where tagid is NULL)
+select personalname, personname, mailboxname || "@" || hostname as id, IFNULL(companyname, "Unknown") as company, count(*) as messages
   from lmdb_messages
     natural join lmdb_envelopejoin
-    natural join lmdb_addresses
+    natural join nonbot_addresses
     left natural join (select * from hostname_to_company natural join companies)
     left natural join (select * from address_to_person natural join person)
-  where envelopepart=1
-  group by id
-  order by messages desc
-  limit 50;
+  where envelopepart=1 and date >= date('now', '-1 year') and personname is null
+  group by id, company
+  having messages > 20
+  order by messages desc;
 
-/* Find out top addresses of 'Unknown' contributors so we can maybe classify them */
-select mailboxname || "@" || hostname as id, IFNULL(companyname, "Unknown") as company, count(*) as messages
+/* Find out top addresses of 'Unknown' hostnames in the last year */
+select hostname, IFNULL(companyname, "Unknown") as company, count(*) as messages
   from lmdb_messages
     natural join lmdb_envelopejoin
     natural join lmdb_addresses
     left natural join (select * from hostname_to_company natural join companies)
-  where envelopepart=1 and company="Unknown"
-  group by id
+  where envelopepart=1 and company="Unknown" and date >= date('now', '-1 year')
+  group by hostname
   order by messages desc
   limit 50;
 
@@ -272,6 +281,123 @@ select strftime("%Y-%m", date) as month,
   from annotated_messages
   group by month
   order by month asc;
+
+/* By person w/ person company map */
+with nonbot_addresses as
+  (select * from lmdb_addresses
+     left natural join
+       (select *
+          from idmap.address_to_tag
+	    natural join idmap.tags
+	    where tagname='bot')
+    where tagid is NULL),
+ annotated_messages as
+  (select *, coalesce(hostcompany, max(personcompany), 'Unknown') as companyname
+    from (
+      select *,
+        case when date between IFNULL(startdate, '0000-01-01') and IFNULL(enddate, '9999-12-31') then personcompanyinner end as personcompany
+      from lmdb_messages
+        natural join lmdb_envelopejoin
+        natural join nonbot_addresses
+        left natural join (
+          select hostname, companyname as hostcompany
+            from hostname_to_company natural join companies)
+        left natural join (
+          select personname, mailboxname, hostname, startdate, enddate, companyname as personcompanyinner
+            from address_to_person
+	      natural join person
+	      left natural join person_to_company
+	      left natural join companies)
+       where envelopepart=1)
+    group by messageid)
+select IFNULL(personname, mailboxname || "@" || hostname) as id, count(*) as messages
+  from annotated_messages
+  where date >= date('now', '-1 year')
+  group by id, companyname
+  having messages > 100
+  order by messages desc;
+
+/* People: Pie chart with cutoff */
+with nonbot_addresses as
+  (select * from lmdb_addresses
+     left natural join
+       (select *
+          from idmap.address_to_tag
+            natural join idmap.tags
+            where tagname='bot')
+    where tagid is NULL),
+ annotated_messages as
+  (select *, coalesce(hostcompany, max(personcompany), 'Unknown') as companyname
+    from (
+      select *,
+        case when date between IFNULL(startdate, '0000-01-01') and IFNULL(enddate, '9999-12-31') then personcompanyinner end as personcompany
+      from lmdb_messages
+        natural join lmdb_envelopejoin
+        natural join nonbot_addresses
+        left natural join (
+          select hostname, companyname as hostcompany
+            from hostname_to_company natural join companies)
+        left natural join (
+          select personname, mailboxname, hostname, startdate, enddate, companyname as personcompanyinner
+            from address_to_person
+              natural join person
+              left natural join person_to_company
+              left natural join companies)
+       where envelopepart=1)
+    group by messageid),
+ grouped_messages as
+  (select IFNULL(personname, mailboxname || "@" || hostname) as label, count(*) as messages
+  from annotated_messages
+  where date < date('2022-09-19') and date >= date('2022-09-19', '-273 days')
+  group by label)
+select label, sum(messages) as messages
+from (
+  select case when messages > 150 then label else 'Other' end as label, messages
+  from grouped_messages
+) as adjusted_labels
+group by label
+order by messages desc;
+
+/* Companies: Pie chart w/ cutoff */
+with nonbot_addresses as
+  (select * from lmdb_addresses
+     left natural join
+       (select *
+          from idmap.address_to_tag
+            natural join idmap.tags
+            where tagname='bot')
+    where tagid is NULL),
+ annotated_messages as
+  (select *, coalesce(hostcompany, max(personcompany), 'Unknown') as companyname
+    from (
+      select *,
+        case when date between IFNULL(startdate, '0000-01-01') and IFNULL(enddate, '9999-12-31') then personcompanyinner end as personcompany
+      from lmdb_messages
+        natural join lmdb_envelopejoin
+        natural join nonbot_addresses
+        left natural join (
+          select hostname, companyname as hostcompany
+            from hostname_to_company natural join companies)
+        left natural join (
+          select personname, mailboxname, hostname, startdate, enddate, companyname as personcompanyinner
+            from address_to_person
+              natural join person
+              left natural join person_to_company
+              left natural join companies)
+       where envelopepart=1)
+    group by messageid),
+ grouped_messages as
+  (select companyname as label, count(*) as messages
+  from annotated_messages
+  where date < date('2022-09-19') and date >= date('2022-09-19', '-273 days')
+  group by label)
+select label, sum(messages) as messages
+from (
+  select case when messages > 150 then label else 'Other' end as label, messages
+  from grouped_messages
+) as adjusted_labels
+group by label
+order by messages desc;
 
 /* Simple mail classification */
 select messageid, date, mailboxname, hostname, subject,

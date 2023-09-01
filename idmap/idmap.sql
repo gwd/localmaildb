@@ -157,3 +157,53 @@ select personalname, mailboxname || '@' || hostname as address, count(*) as n
 
 /* SCRATCH */
 
+insert into idmap.address_to_person(mailboxname, hostname, personid) 
+    select * from (values ('JBeulich', 'suse.com'), ('jbeulich', 'suse.com'))
+        left join (select personid
+	          from idmap.person
+		  where personname="Jan Beulich");
+
+/* Add people to the 'person' table based on the 'personalname' in the
+ * email address */
+with nonbot_addresses as
+  (select * from lmdb_addresses
+     left natural join
+       (select *
+          from idmap.address_to_tag
+	    natural join idmap.tags
+	    where tagname='bot')
+    where tagid is NULL)
+insert into person(personname)
+select personalname/*, personname, mailboxname, hostname, personid*/
+  from lmdb_messages
+    natural join lmdb_envelopejoin
+    natural join nonbot_addresses
+    left join person on personalname=personname
+    left natural join (select personid as a2pid, mailboxname, hostname from address_to_person)
+  where envelopepart=1 and date >= date('now', '-1 year') and a2pid is null
+    and hostname not in ('redhat.com')
+    and personalname not in ('Borislav Petkov', 'Vishal Moola (Oracle)', 'Thomas Gleixner', 'Suren Baghadasaryan', 'Carlo Nonato', 'Bernhard Beschow', 'Andy Shevchenko')
+  group by personalname,mailboxname,hostname
+  having count(*) > 50
+  order by personalname;
+
+/* Add address_to_person mappings where the 'personalname' of the address maps
+ * 'personname' in the 'person' table */
+with nonbot_addresses as
+  (select * from lmdb_addresses
+     left natural join
+       (select *
+          from idmap.address_to_tag
+	    natural join idmap.tags
+	    where tagname='bot')
+    where tagid is NULL)
+insert into idmap.address_to_person(mailboxname, hostname, personid)
+select mailboxname, hostname, personid
+  from lmdb_messages
+    natural join lmdb_envelopejoin
+    natural join nonbot_addresses
+    join person on personalname=personname
+    left natural join (select personid as a2pid, mailboxname, hostname from address_to_person)
+  where envelopepart=1 and date >= date('now', '-1 year') and a2pid is null
+  group by mailboxname,hostname;
+

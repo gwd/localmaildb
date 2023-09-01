@@ -9,15 +9,14 @@ into a localmaildb-format SQLite file.
 The minimal content required for xen-devel:
 
     mkdir -p xen-devel/git
-	git clone git clone --mirror https://lore.kernel.org/xen-devel/0 xen-devel/git/0
-	git clone git clone --mirror https://lore.kernel.org/xen-devel/0 xen-devel/git/1
+    git clone --mirror https://lore.kernel.org/xen-devel/0 xen-devel/git/0
+    git clone --mirror https://lore.kernel.org/xen-devel/0 xen-devel/git/1
 
 ## Do an import
 
     pubinfetch -mdb xen-devel/xen-devel.sqlite -pipath xen-devel
 
-This may take a long time; I think it took maybe two hours the first
-time.
+This may take a while; most recent run on my Macbook took about 20 minutes.
 
 ## Doing data mining
 
