@@ -218,7 +218,7 @@ func (src *ImapSource) goProcessEnvelopeBatch(envreq *fetchReq, envelopeBatch ch
 		src.bodyStatusChan <- bodyStatus
 	}
 
-	err := envreq.done
+	err := <-envreq.done
 	if err != nil {
 		log.Printf("Envelope fetch error: %v", err)
 	}
