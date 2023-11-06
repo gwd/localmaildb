@@ -18,6 +18,8 @@ func TestSubjectClassifier(t *testing.T) {
 		{"[RFC PATCH 0/8] SVE feature for arm guests", PatchMail0N},
 		{"[PATCH v2 00/41] xen/arm: Add Armv8-R64 MPU support to Xen - Part#1", PatchMail0N},
 		{"[PATCH XSA-438 v4] x86/shadow: defer releasing of PV's top-level shadow reference", PatchMailSingleton},
+		{"[PATCH for-4.18 0/2] golang: Binding fixes", PatchMail0N},
+		{"[PATCH for-4.18 1/2] golang: Fixup binding for Arm FF-A", PatchMailMN},
 	}
 
 	for _, test := range tests {
