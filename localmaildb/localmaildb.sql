@@ -348,8 +348,8 @@ with nonbot_addresses as
  grouped_messages as
   (select IFNULL(personname, mailboxname || "@" || hostname) as label, count(*) as messages
   from annotated_messages
-  where date < date('2022-09-19') and date >= date('2022-09-19', '-273 days')
-  group by label)
+  where date < date('2023-11-16') and date >= date('2022-12-09')
+   group by label)
 select label, sum(messages) as messages
 from (
   select case when messages > 150 then label else 'Other' end as label, messages
@@ -357,6 +357,53 @@ from (
 ) as adjusted_labels
 group by label
 order by messages desc;
+
+/* People: Pie chart w/ adaptive cutoff */
+with nonbot_addresses as
+  (select * from lmdb_addresses
+     left natural join
+       (select *
+          from idmap.address_to_tag
+            natural join idmap.tags
+            where tagname='bot')
+    where tagid is NULL),
+ annotated_messages as
+  (select *, coalesce(hostcompany, max(personcompany), 'Unknown') as companyname
+    from (
+      select *,
+        case when date between IFNULL(startdate, '0000-01-01') and IFNULL(enddate, '9999-12-31') then personcompanyinner end as personcompany
+      from lmdb_messages
+        natural join lmdb_envelopejoin
+        natural join nonbot_addresses
+        left natural join (
+          select hostname, companyname as hostcompany
+            from hostname_to_company natural join companies)
+        left natural join (
+          select personname, mailboxname, hostname, startdate, enddate, companyname as personcompanyinner
+            from address_to_person
+              natural join person
+              left natural join person_to_company
+              left natural join companies)
+       where envelopepart=1)
+    group by messageid),
+ grouped_messages as
+  (select IFNULL(personname, mailboxname || "@" || hostname) as label, count(*) as messages
+  from annotated_messages
+  where date < date('2023-11-16') and date >= date('2022-12-09')
+   group by label),
+ total_messages as
+  (select sum(messages) as total
+   from grouped_messages),
+ cutoff as
+  (select total * 0.01 as cutoff_value from total_messages)
+select label, sum(messages) as messages
+from (
+  select case when messages > (select cutoff_value from cutoff) then label else 'Other' end as label, messages
+  from grouped_messages
+) as adjusted_labels
+group by label
+order by messages desc;
+
 
 /* Companies: Pie chart w/ cutoff */
 with nonbot_addresses as
@@ -389,7 +436,7 @@ with nonbot_addresses as
  grouped_messages as
   (select companyname as label, count(*) as messages
   from annotated_messages
-  where date < date('2022-09-19') and date >= date('2022-09-19', '-273 days')
+  where date < date('2023-11-16') and date >= date('2022-12-09') /* 4.18 development window */
   group by label)
 select label, sum(messages) as messages
 from (
@@ -398,6 +445,55 @@ from (
 ) as adjusted_labels
 group by label
 order by messages desc;
+
+/*
+ * Companies: Pie chart w/ adaptive cut-off
+ */
+with nonbot_addresses as
+  (select * from lmdb_addresses
+     left natural join
+       (select *
+          from idmap.address_to_tag
+            natural join idmap.tags
+            where tagname='bot')
+    where tagid is NULL),
+ annotated_messages as
+  (select *, coalesce(hostcompany, max(personcompany), 'Unknown') as companyname
+    from (
+      select *,
+        case when date between IFNULL(startdate, '0000-01-01') and IFNULL(enddate, '9999-12-31') then personcompanyinner end as personcompany
+      from lmdb_messages
+        natural join lmdb_envelopejoin
+        natural join nonbot_addresses
+        left natural join (
+          select hostname, companyname as hostcompany
+            from hostname_to_company natural join companies)
+        left natural join (
+          select personname, mailboxname, hostname, startdate, enddate, companyname as personcompanyinner
+            from address_to_person
+              natural join person
+              left natural join person_to_company
+              left natural join companies)
+       where envelopepart=1)
+    group by messageid),
+ grouped_messages as
+  (select companyname as label, count(*) as messages
+  from annotated_messages
+  where date < date('2023-11-16') and date >= date('2022-12-09') /* 4.18 development window */
+  group by label),
+ total_messages as
+  (select sum(messages) as total
+   from grouped_messages),
+ cutoff as
+  (select total * 0.01 as cutoff_value from total_messages)
+select label, sum(messages) as messages
+from (
+  select case when messages > (select cutoff_value from cutoff) then label else 'Other' end as label, messages
+  from grouped_messages
+) as adjusted_labels
+group by label
+order by messages desc;
+
 
 /* Simple mail classification */
 select messageid, date, mailboxname, hostname, subject,
@@ -409,7 +505,7 @@ select messageid, date, mailboxname, hostname, subject,
   order by random()
   limit 50;
 
-/* Histogram of imple mail classification */
+/* Histogram of simple mail classification */
 with nonbot_addresses as
   (select * from lmdb_addresses
      left natural join
@@ -433,6 +529,7 @@ select strftime('%Y-%m', date) as month,
     where envelopepart=1)
   group by month
   order by month asc;
+
 
 
 /* Messages CC'd to george.dunlap@* from dfaggioli@* with PATCH in the title and no RE: */

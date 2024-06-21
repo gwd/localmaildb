@@ -125,7 +125,7 @@ select messageid, mailboxname, hostname, date, companyname
   limit 30;
 
 /*
- * Addresses not linked to a company (either by hostname or person), ordered by volume
+ * Addresses in the last year not linked to a company (either by hostname or person), ordered by volume
  */
 
 with annotated_messages as
@@ -149,10 +149,44 @@ with annotated_messages as
     group by messageid)
 select personalname, mailboxname || '@' || hostname as address, count(*) as n
   from annotated_messages
-  where companyname='Unknown'
+  where companyname='Unknown' and date >= date('now', '-1 year') 
   group by address
   order by n desc
   limit 50;
+
+
+/*
+ * Addresses not linked to a person
+ */
+with annotated_messages as
+      (
+      select *
+      from lmdb_messages
+        natural join lmdb_envelopejoin
+        natural join lmdb_addresses
+        left natural join (
+          select personid, mailboxname, hostname
+            from address_to_person
+	      natural join person)
+    where envelopepart=1
+    group by messageid)
+select personalname, mailboxname || '@' || hostname as address, count(*) as n
+  from annotated_messages
+  where personid is null and date >= date('now', '-1 year')
+  group by address
+  order by n desc
+  limit 50;
+
+/*
+ * People who are not linked to a company, who have an email address
+ * with a hostname not linked to a company
+ */
+SELECT p.personid, p.personname, ap.mailboxname, ap.hostname
+  FROM idmap.person p
+    LEFT JOIN idmap.person_to_company ptc ON p.personid = ptc.personid
+    LEFT JOIN idmap.address_to_person ap ON p.personid = ap.personid
+    LEFT JOIN idmap.hostname_to_company htc ON ap.hostname = htc.hostname
+  WHERE ptc.personid IS NULL AND htc.hostname IS NULL;
 
 
 /* SCRATCH */
@@ -207,3 +241,6 @@ select mailboxname, hostname, personid
   where envelopepart=1 and date >= date('now', '-1 year') and a2pid is null
   group by mailboxname,hostname;
 
+
+
+insert into person(personname) values ('Nicola Vetrini', 'Simone Ballarin', 'Federico Serafini');
